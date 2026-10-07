@@ -1,0 +1,24 @@
+provider:
+  name: aws
+
+# Creates and updates records, never deletes them.
+policy: upsert-only
+
+registry: txt
+txtOwnerId: eks-v2-dev-cluster
+
+sources:
+  - ingress
+  - traefik-proxy
+  - service
+
+domainFilters:
+  - eksv2.naimaosmann.com
+
+extraArgs:
+  - --aws-zone-type=public
+
+# Must match the Pod Identity association in Terraform (external-dns / external-dns).
+serviceAccount:
+  create: true
+  name: external-dns

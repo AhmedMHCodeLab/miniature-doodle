@@ -1,0 +1,196 @@
+name: Application Pipeline
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "services/**"
+      - ".github/workflows/ci.yaml"
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+    paths:
+      - "services/**"
+      - ".github/workflows/ci.yaml"
+
+permissions:
+  id-token: write
+  contents: read
+  security-events: write
+  pull-requests: read
+
+jobs:
+  detect-changes:
+    name: Detect Changed Services
+    runs-on: ubuntu-latest
+    outputs:
+      services: ${{ steps.result.outputs.services }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Generate path filters from services directory
+        id: gen-filters
+        run: |
+          {
+            echo "filters<<EOF"
+            for dir in services/*/; do
+              name=$(basename "$dir")
+              echo "${name}:"
+              echo "  - 'services/${name}/**'"
+              echo "  - '.github/workflows/ci.yaml'"
+            done
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Filter changed paths
+        if: github.event_name != 'workflow_dispatch'
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: ${{ steps.gen-filters.outputs.filters }}
+          list-files: json
+
+      # Manual runs (workflow_dispatch) build every service
+      - name: Select services to build
+        id: result
+        env:
+          CHANGED: ${{ steps.filter.outputs.changes }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            services=$(ls -d services/*/ | xargs -n1 basename | jq -R . | jq -sc .)
+          else
+            services="$CHANGED"
+          fi
+          echo "services=${services}" >> "$GITHUB_OUTPUT"
+
+  build-and-push:
+    name: Build, Scan and Push Image
+    needs: detect-changes
+    if: ${{ needs.detect-changes.outputs.services != '[]' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ${{ fromJSON(needs.detect-changes.outputs.services) }}
+
+    outputs:
+      image: ${{ steps.meta.outputs.tag }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache-dependency-path: services/${{ matrix.service }}/go.sum
+
+      - name: Run go vet
+        working-directory: services/${{ matrix.service }}
+        run: go vet ./...
+
+      - name: Run unit tests
+        working-directory: services/${{ matrix.service }}
+        run: go test -race -count=1 ./...
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Log in to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image tag
+        id: meta
+        run: |
+          SHA=$(echo "${{ github.sha }}" | cut -c1-8)
+          echo "tag=${{ steps.login-ecr.outputs.registry }}/${{ secrets.AWS_ECR_REPO }}:${{ matrix.service }}-$SHA" >> $GITHUB_OUTPUT
+
+      - name: Build image
+        run: docker build -t ${{ steps.meta.outputs.tag }} ./services/${{ matrix.service }}
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ steps.meta.outputs.tag }}
+          format: table
+          exit-code: "1"
+          severity: HIGH,CRITICAL
+          scanners: vuln
+
+      # Push on merges and manual runs, never on PRs.
+      # skips on already-built commit instead of failing.
+      - name: Push image to ECR
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE: ${{ steps.meta.outputs.tag }}
+          REPOSITORY: ${{ secrets.AWS_ECR_REPO }}
+        run: |
+          if aws ecr describe-images --repository-name "$REPOSITORY" --image-ids imageTag="${IMAGE##*:}" >/dev/null 2>&1; then
+            echo "${IMAGE##*:} is already in ECR, skipping push"
+          else
+            docker push "$IMAGE"
+          fi
+
+  # Points dev at the new images: ArgoCD deploys whatever tag is in these files.
+  update-dev-tags:
+    name: Update Dev Image Tags
+    needs: [detect-changes, build-and-push]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+
+    concurrency:
+      group: update-dev-tags
+      cancel-in-progress: false
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Checkout Repository
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Write new tags into the dev values
+        env:
+          SERVICES: ${{ needs.detect-changes.outputs.services }}
+        run: |
+          SHA=$(echo "${{ github.sha }}" | cut -c1-8)
+          for svc in $(echo "$SERVICES" | jq -r '.[]'); do
+            file="kubernetes/deploy/envs/dev/${svc}.yaml"
+            if [ ! -f "$file" ]; then
+              echo "::error::$file not found"
+              exit 1
+            fi
+            sed -i -E "s|^(  tag: ).*|\1${svc}-${SHA}|" "$file"
+            echo "$svc -> ${svc}-${SHA}"
+          done
+
+      - name: Commit and push
+        run: |
+          if git diff --quiet; then
+            echo "No tag changes"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git commit -am "chore(deploy): point dev at ${GITHUB_SHA::8} images"
+          git pull --rebase origin main
+          git push origin HEAD:main

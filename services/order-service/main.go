@@ -1,0 +1,523 @@
+package main
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
+
+	_ "github.com/lib/pq"
+)
+
+var db *sql.DB
+
+type Order struct {
+	ID         int             `json:"id"`
+	CustomerID string          `json:"customer_id"`
+	Status     string          `json:"status"`
+	Items      json.RawMessage `json:"items"`
+	Total      float64         `json:"total"`
+	Currency   string          `json:"currency"`
+	Notes      string          `json:"notes,omitempty"`
+	CreatedAt  string          `json:"created_at"`
+	UpdatedAt  string          `json:"updated_at"`
+}
+
+type CreateOrderRequest struct {
+	Items    []OrderItem `json:"items"`
+	Currency string      `json:"currency"`
+	Notes    string      `json:"notes,omitempty"`
+}
+
+type OrderItem struct {
+	ProductID string  `json:"product_id"`
+	Quantity  int     `json:"quantity"`
+	Price     float64 `json:"price"`
+}
+
+// Valid state transitions
+var validTransitions = map[string][]string{
+	"pending":    {"confirmed", "cancelled"},
+	"confirmed":  {"processing", "cancelled"},
+	"processing": {"shipped", "cancelled"},
+	"shipped":    {"delivered"},
+	"delivered":  {},
+	"cancelled":  {},
+}
+
+func main() {
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		log.Fatal("DATABASE_URL is required")
+	}
+
+	var err error
+	db, err = sql.Open("postgres", dbURL)
+	if err != nil {
+		log.Fatalf("Failed to connect to database: %v", err)
+	}
+	defer db.Close()
+
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(5 * time.Minute)
+
+	waitForDB()
+	migrate()
+
+	// Outbox relay: delivers events saved in order_outbox to SQS in the background.
+	// Without SQS_QUEUE_URL, events are still saved and wait until a queue is configured.
+	relayCtx, stopRelay := context.WithCancel(context.Background())
+	relayDone := make(chan struct{})
+	if queueURL := os.Getenv("SQS_QUEUE_URL"); queueURL != "" {
+		pub, err := newSQSPublisher(relayCtx, queueURL)
+		if err != nil {
+			log.Fatalf("SQS publisher setup failed: %v", err)
+		}
+		go func() {
+			defer close(relayDone)
+			runOutboxRelay(relayCtx, pub, time.Second)
+		}()
+		log.Printf("Outbox relay started, publishing to %s", queueURL)
+	} else {
+		close(relayDone)
+		log.Println("WARNING: SQS_QUEUE_URL not set; events are stored in order_outbox but not delivered")
+	}
+    startMetricsServer(getEnv("METRICS_PORT", "9090")) 
+	mux := http.NewServeMux()
+	mux.HandleFunc("/livez", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("/healthz", handleHealth)
+	mux.HandleFunc("/", handleOrders)
+	mux.HandleFunc("/status", handleUpdateStatus)
+
+	port := getEnv("PORT", "8081")
+	server := &http.Server{
+		Addr:         ":" + port,
+		Handler:      instrument(mux),
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
+
+	go func() {
+		log.Printf("Order service listening on :%s", port)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("server error: %v", err)
+		}
+	}()
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	<-sigChan
+
+	log.Println("Shutting down...")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Printf("graceful shutdown error: %v", err)
+	}
+
+	// Stop the relay after HTTP traffic has drained, and let its current batch finish.
+	stopRelay()
+	select {
+	case <-relayDone:
+	case <-shutdownCtx.Done():
+		log.Println("outbox relay did not stop before shutdown timeout")
+	}
+}
+
+func migrate() {
+	migrations := []string{
+		`CREATE TABLE IF NOT EXISTS orders (
+			id SERIAL PRIMARY KEY,
+			customer_id VARCHAR(255) NOT NULL,
+			status VARCHAR(20) NOT NULL DEFAULT 'pending',
+			items JSONB NOT NULL,
+			total DECIMAL(12,2) NOT NULL DEFAULT 0,
+			currency VARCHAR(3) NOT NULL DEFAULT 'GBP',
+			notes TEXT,
+			created_at TIMESTAMP DEFAULT NOW(),
+			updated_at TIMESTAMP DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_orders_customer ON orders(customer_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)`,
+		`CREATE TABLE IF NOT EXISTS order_events (
+			id SERIAL PRIMARY KEY,
+			order_id INTEGER NOT NULL REFERENCES orders(id),
+			event_type VARCHAR(50) NOT NULL,
+			old_status VARCHAR(20),
+			new_status VARCHAR(20),
+			metadata JSONB,
+			created_at TIMESTAMP DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_order_events_order ON order_events(order_id)`,
+		// Transactional outbox (see outbox.go). Named order_outbox, not outbox, because all
+		// services share one database and each producer will own its own outbox table.
+		// TIMESTAMPTZ avoids the timezone bug found in the scheduler's TIMESTAMP columns.
+		`CREATE TABLE IF NOT EXISTS order_outbox (
+			id BIGSERIAL PRIMARY KEY,
+			event_type VARCHAR(100) NOT NULL,
+			payload JSONB NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			sent_at TIMESTAMPTZ,
+			attempts INTEGER NOT NULL DEFAULT 0,
+			last_error TEXT
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_order_outbox_unsent ON order_outbox(id) WHERE sent_at IS NULL`,
+	}
+	for _, m := range migrations {
+		if _, err := db.Exec(m); err != nil {
+			log.Fatalf("Migration failed: %v", err)
+		}
+	}
+	log.Println("Order service migrations complete")
+}
+
+func handleHealth(w http.ResponseWriter, r *http.Request) {
+	status := "ok"
+	if err := db.Ping(); err != nil {
+		status = "unhealthy"
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": status, "service": "order-service"})
+}
+
+func handleOrders(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		// GET / - list orders (filtered by customer from header)
+		// GET /{id} - get specific order
+		path := strings.TrimPrefix(r.URL.Path, "/")
+		if path != "" && path != "/" {
+			getOrder(w, r, path)
+		} else {
+			listOrders(w, r)
+		}
+	case http.MethodPost:
+		createOrder(w, r)
+	default:
+		httpError(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func createOrder(w http.ResponseWriter, r *http.Request) {
+	customerID := r.Header.Get("X-User-Email")
+	if customerID == "" {
+		httpError(w, "missing customer identity", http.StatusBadRequest)
+		return
+	}
+
+	var req CreateOrderRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if len(req.Items) == 0 {
+		httpError(w, "order must have at least one item", http.StatusBadRequest)
+		return
+	}
+
+	// Prices and stock come from inventory; whatever price the request carried is dropped.
+	priced, rej := priceItems(r.Context(), req.Items)
+	if rej != nil {
+		httpError(w, rej.msg, rej.status)
+		return
+	}
+	req.Items = priced
+
+	// Calculate total
+	var total float64
+	for _, item := range req.Items {
+		total += item.Price * float64(item.Quantity)
+	}
+	total = roundMoney(total) // 3 x 79.99 is 239.96999999999997 as a float
+
+	currency := req.Currency
+	if currency == "" {
+		currency = "GBP"
+	}
+
+	itemsJSON, _ := json.Marshal(req.Items)
+
+	// One transaction: the order, its history row and its outbox event are saved
+	// together or not at all. The event is delivered to SQS later by the outbox relay.
+	tx, err := db.Begin()
+	if err != nil {
+		log.Printf("Create order error: begin: %v", err)
+		httpError(w, "failed to create order", http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	var orderID int
+	err = tx.QueryRow(
+		`INSERT INTO orders (customer_id, status, items, total, currency, notes)
+		 VALUES ($1, 'pending', $2, $3, $4, $5) RETURNING id`,
+		customerID, itemsJSON, total, currency, req.Notes,
+	).Scan(&orderID)
+	if err != nil {
+		log.Printf("Create order error: %v", err)
+		httpError(w, "failed to create order", http.StatusInternalServerError)
+		return
+	}
+
+	// Record event
+	if _, err := tx.Exec(
+		`INSERT INTO order_events (order_id, event_type, new_status)
+		 VALUES ($1, 'order_created', 'pending')`,
+		orderID,
+	); err != nil {
+		log.Printf("Create order error: order_events: %v", err)
+		httpError(w, "failed to create order", http.StatusInternalServerError)
+		return
+	}
+
+	// Queue order.created for downstream services (inventory reservation, etc.)
+	if err := enqueueEvent(tx, "order.created", map[string]interface{}{
+		"order_id":    orderID,
+		"customer_id": customerID,
+		"items":       req.Items,
+		"total":       total,
+		"currency":    currency,
+	}); err != nil {
+		log.Printf("Create order error: %v", err)
+		httpError(w, "failed to create order", http.StatusInternalServerError)
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		log.Printf("Create order error: commit: %v", err)
+		httpError(w, "failed to create order", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"id":     orderID,
+		"status": "pending",
+		"total":  total,
+	})
+}
+
+func listOrders(w http.ResponseWriter, r *http.Request) {
+	customerID := r.Header.Get("X-User-Email")
+	status := r.URL.Query().Get("status")
+
+	query := "SELECT id, customer_id, status, items, total, currency, notes, created_at, updated_at FROM orders WHERE 1=1"
+	args := []interface{}{}
+	argN := 1
+
+	if customerID != "" {
+		query += fmt.Sprintf(" AND customer_id = $%d", argN)
+		args = append(args, customerID)
+		argN++
+	}
+	if status != "" {
+		query += fmt.Sprintf(" AND status = $%d", argN)
+		args = append(args, status)
+		argN++
+	}
+	query += " ORDER BY created_at DESC LIMIT 100"
+
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		httpError(w, "query failed", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	orders := []Order{}
+	for rows.Next() {
+		var o Order
+		if err := rows.Scan(&o.ID, &o.CustomerID, &o.Status, &o.Items, &o.Total, &o.Currency, &o.Notes, &o.CreatedAt, &o.UpdatedAt); err != nil {
+			httpError(w, "scan failed", http.StatusInternalServerError)
+			return
+		}
+		orders = append(orders, o)
+	}
+	if err := rows.Err(); err != nil {
+		httpError(w, "iteration failed", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(orders)
+}
+
+func getOrder(w http.ResponseWriter, r *http.Request, id string) {
+	var o Order
+	err := db.QueryRow(
+		"SELECT id, customer_id, status, items, total, currency, notes, created_at, updated_at FROM orders WHERE id = $1",
+		id,
+	).Scan(&o.ID, &o.CustomerID, &o.Status, &o.Items, &o.Total, &o.Currency, &o.Notes, &o.CreatedAt, &o.UpdatedAt)
+
+	if err != nil {
+		httpError(w, "order not found", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(o)
+}
+
+func handleUpdateStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		httpError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		OrderID   int    `json:"order_id"`
+		NewStatus string `json:"new_status"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Get current status
+	var currentStatus string
+	err := db.QueryRow("SELECT status FROM orders WHERE id = $1", req.OrderID).Scan(&currentStatus)
+	if err != nil {
+		httpError(w, "order not found", http.StatusNotFound)
+		return
+	}
+
+	// Asking for the status the order already has is a repeat (for example a redelivered
+	// SQS message), not a conflict. Answer 200 and change nothing.
+	if currentStatus == req.NewStatus {
+		writeStatusChange(w, req.OrderID, currentStatus, req.NewStatus, false)
+		return
+	}
+
+	// Validate transition
+	allowed, ok := validTransitions[currentStatus]
+	if !ok {
+		httpError(w, "invalid current status", http.StatusBadRequest)
+		return
+	}
+
+	valid := false
+	for _, s := range allowed {
+		if s == req.NewStatus {
+			valid = true
+			break
+		}
+	}
+	if !valid {
+		httpError(w, fmt.Sprintf("cannot transition from %s to %s", currentStatus, req.NewStatus), http.StatusConflict)
+		return
+	}
+
+	// One transaction: status change, history row and outbox event are saved together.
+	tx, err := db.Begin()
+	if err != nil {
+		httpError(w, "failed to update order", http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	// Only change the status if it is still the one we read (compare-and-set). If another
+	// request changed it in between, Postgres re-checks this WHERE against the new row and
+	// updates nothing, so two concurrent changes can't both win.
+	res, err := tx.Exec(
+		"UPDATE orders SET status = $1, updated_at = NOW() WHERE id = $2 AND status = $3",
+		req.NewStatus, req.OrderID, currentStatus,
+	)
+	if err != nil {
+		httpError(w, "failed to update order", http.StatusInternalServerError)
+		return
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		httpError(w, "failed to update order", http.StatusInternalServerError)
+		return
+	} else if n == 0 {
+		tx.Rollback()
+		var nowStatus string
+		if err := db.QueryRow("SELECT status FROM orders WHERE id = $1", req.OrderID).Scan(&nowStatus); err != nil {
+			httpError(w, "failed to update order", http.StatusInternalServerError)
+			return
+		}
+		if nowStatus == req.NewStatus {
+			// A concurrent copy of the same request got there first.
+			writeStatusChange(w, req.OrderID, nowStatus, req.NewStatus, false)
+			return
+		}
+		httpError(w, fmt.Sprintf("order changed to %s while updating", nowStatus), http.StatusConflict)
+		return
+	}
+
+	// Record event
+	if _, err := tx.Exec(
+		`INSERT INTO order_events (order_id, event_type, old_status, new_status)
+		 VALUES ($1, 'status_changed', $2, $3)`,
+		req.OrderID, currentStatus, req.NewStatus,
+	); err != nil {
+		httpError(w, "failed to update order", http.StatusInternalServerError)
+		return
+	}
+
+	// Queue event
+	if err := enqueueEvent(tx, "order.status_changed", map[string]interface{}{
+		"order_id":   req.OrderID,
+		"old_status": currentStatus,
+		"new_status": req.NewStatus,
+	}); err != nil {
+		log.Printf("Update status error: %v", err)
+		httpError(w, "failed to update order", http.StatusInternalServerError)
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		httpError(w, "failed to update order", http.StatusInternalServerError)
+		return
+	}
+
+	writeStatusChange(w, req.OrderID, currentStatus, req.NewStatus, true)
+}
+
+// writeStatusChange answers a status request. changed is false when the order was
+// already in the requested status, so nothing was written.
+func writeStatusChange(w http.ResponseWriter, orderID int, oldStatus, newStatus string, changed bool) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"order_id":   orderID,
+		"old_status": oldStatus,
+		"new_status": newStatus,
+		"changed":    changed,
+	})
+}
+
+func httpError(w http.ResponseWriter, msg string, code int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(map[string]string{"error": msg})
+}
+
+func getEnv(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func waitForDB() {
+	for i := 0; i < 120; i++ {
+		if err := db.Ping(); err == nil {
+			return
+		}
+		log.Printf("Waiting for database... (%d/120)", i+1)
+		time.Sleep(time.Second)
+	}
+	log.Fatal("Database not ready after 120s")
+}
