@@ -1,5 +1,7 @@
 # notification-service in dev.
 image:
-  tag: notification-service-28c526e5
+  tag: notification-service-0aedbc78
 
-replicaCount: 1
+autoscaling:
+  minReplicas: 1
+  maxReplicas: 3

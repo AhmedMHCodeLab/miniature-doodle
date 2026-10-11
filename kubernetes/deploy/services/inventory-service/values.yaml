@@ -1,15 +1,11 @@
 # inventory-service
 component: api
 containerPort: 8082
-metricsPort: 9090
 
 env:
   PGAPPNAME: inventory-service
 
 database:
-  enabled: true
-
-serviceMonitor:
   enabled: true
 
 resources:
@@ -18,3 +14,6 @@ resources:
     memory: 64Mi
   limits:
     memory: 128Mi
+
+autoscaling:
+  enabled: true

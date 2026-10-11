@@ -1,0 +1,1326 @@
+diff --git a/.github/workflows/terraform-apply.yaml b/.github/workflows/terraform-apply.yaml
+index e447b4b..1cd95e2 100644
+--- a/.github/workflows/terraform-apply.yaml
++++ b/.github/workflows/terraform-apply.yaml
+@@ -53,4 +53,7 @@ jobs:
+               github-token: ${{ secrets.GITHUB_TOKEN }}
+ 
+          - name: Terraform Apply
++           env:
++             TF_VAR_admin_password: ${{ secrets.ADMIN_PASSWORD }}
++             TF_VAR_carrier_webhook_secret: ${{ secrets.CARRIER_WEBHOOK_SECRET }}
+            run: terraform apply tfplan.binary
+\ No newline at end of file
+diff --git a/.github/workflows/terraform-destroy.yaml b/.github/workflows/terraform-destroy.yaml
+index 3655069..4fc8b74 100644
+--- a/.github/workflows/terraform-destroy.yaml
++++ b/.github/workflows/terraform-destroy.yaml
+@@ -51,6 +51,9 @@ jobs:
+           terraform init -input=false
+ 
+       - name: Terraform Destroy Plan
++        env:
++          TF_VAR_admin_password: ${{ secrets.ADMIN_PASSWORD }}
++          TF_VAR_carrier_webhook_secret: ${{ secrets.CARRIER_WEBHOOK_SECRET }}
+         run: |
+           echo "Running terraform destroy plan..."
+           terraform plan -destroy -input=false -out=destroy.tfplan
+@@ -125,6 +128,9 @@ jobs:
+           path: ${{ env.TF_WORKING_DIR }}
+ 
+       - name: Terraform Destroy
++        env:
++          TF_VAR_admin_password: ${{ secrets.ADMIN_PASSWORD }}
++          TF_VAR_carrier_webhook_secret: ${{ secrets.CARRIER_WEBHOOK_SECRET }}
+         run: |
+           echo "Destroying the resources in the approved plan..."
+           terraform apply -input=false destroy.tfplan
+diff --git a/.github/workflows/terraform-plan.yaml b/.github/workflows/terraform-plan.yaml
+index 8153d45..6c59f22 100644
+--- a/.github/workflows/terraform-plan.yaml
++++ b/.github/workflows/terraform-plan.yaml
+@@ -66,6 +66,9 @@ jobs:
+           output_format: github_failed_only
+ 
+       - name: Terraform Plan
++        env:
++          TF_VAR_admin_password: ${{ secrets.ADMIN_PASSWORD }}
++          TF_VAR_carrier_webhook_secret: ${{ secrets.CARRIER_WEBHOOK_SECRET }}
+         run: |
+           echo "Running terraform plan..."
+           terraform plan -input=false -out=tfplan.binary
+diff --git a/docker-compose.yml b/docker-compose.yml
+index fb24c90..ba3a839 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -50,6 +50,9 @@ services:
+       <<: *service-urls
+       REDIS_URL: redis://redis:6379
+       JWT_SECRET: local-dev-secret
++      # The one dashboard login. Local-only values; on EKS the password comes from Secrets Manager.
++      ADMIN_EMAIL: admin@platform.local
++      ADMIN_PASSWORD: admin
+       DASHBOARD_SERVICE_URL: http://dashboard-api:8086
+       # Rate limits per window (defaults shown). No proxy locally, so no trusted proxies.
+       RATE_LIMIT_WINDOW_SECONDS: "60"
+@@ -115,6 +118,7 @@ services:
+     environment:
+       <<: [*database-env, *floci-env]
+       PGAPPNAME: shipping-service
++      CARRIER_WEBHOOK_SECRET: local-carrier-secret   # local only; EKS gets it from Secrets Manager
+     depends_on:
+       - postgres
+       - floci
+diff --git a/infra/terraform/main.tf b/infra/terraform/main.tf
+index 1c963d0..cc1c5b5 100644
+--- a/infra/terraform/main.tf
++++ b/infra/terraform/main.tf
+@@ -22,33 +22,38 @@ module "eks" {
+ module "pod-identity" {
+   source = "./modules/pod-identity"
+ 
+-  db_credentials_secret_arn = module.secrets_manager.db_credentials_secret_arn
+-  db_connection_secret_arn  = module.rds.db_connection_secret_arn
+-  grafana_secret_arn        = module.secrets_manager.grafana_password_secret_arn
+-  jwt_secret_arn            = module.secrets_manager.jwt_secret_arn
+-  project_name              = var.project_name
+-  cluster_name              = module.eks.cluster_name
+-  kms_key_arn               = module.secrets_manager.kms_key_arn
+-  environment               = var.environment
+-  aws_region                = var.aws_region
+-  worker_node_role_arn      = module.eks.node_role_arn
+-  sqs_queue_arn             = module.sqs.queue_arn
+-  route53_hosted_zone_arn   = data.aws_route53_zone.main.arn
++  db_credentials_secret_arn  = module.secrets_manager.db_credentials_secret_arn
++  db_connection_secret_arn   = module.rds.db_connection_secret_arn
++  grafana_secret_arn         = module.secrets_manager.grafana_password_secret_arn
++  jwt_secret_arn             = module.secrets_manager.jwt_secret_arn
++  admin_password_secret_arn  = module.secrets_manager.admin_password_secret_arn
++  carrier_webhook_secret_arn = module.secrets_manager.carrier_webhook_secret_arn
++  project_name               = var.project_name
++  cluster_name               = module.eks.cluster_name
++  kms_key_arn                = module.secrets_manager.kms_key_arn
++  environment                = var.environment
++  aws_region                 = var.aws_region
++  worker_node_role_arn       = module.eks.node_role_arn
++  sqs_queue_arn              = module.sqs.queue_arn
++  route53_hosted_zone_arn    = data.aws_route53_zone.main.arn
+ 
+ }
+ 
+ module "secrets_manager" {
+   source = "./modules/secrets-manager"
+ 
+-  project_name = var.project_name
+-  environment  = var.environment
++  project_name           = var.project_name
++  environment            = var.environment
++  admin_password         = var.admin_password
++  carrier_webhook_secret = var.carrier_webhook_secret
+ }
+ 
+ module "sqs" {
+   source = "./modules/sqs"
+ 
+-  project_name = var.project_name
+-  environment  = var.environment
++  project_name      = var.project_name
++  environment       = var.environment
++  dlq_alarm_actions = var.dlq_alarm_actions
+ }
+ 
+ module "rds" {
+diff --git a/infra/terraform/modules/pod-identity/main.tf b/infra/terraform/modules/pod-identity/main.tf
+index 7df64b5..6bafb0f 100644
+--- a/infra/terraform/modules/pod-identity/main.tf
++++ b/infra/terraform/modules/pod-identity/main.tf
+@@ -41,7 +41,9 @@ resource "aws_iam_policy" "secrets_manager_read" {
+           var.db_credentials_secret_arn,
+           var.db_connection_secret_arn,
+           var.grafana_secret_arn,
+-          var.jwt_secret_arn
++          var.jwt_secret_arn,
++          var.admin_password_secret_arn,
++          var.carrier_webhook_secret_arn
+         ]
+       },
+       {
+diff --git a/infra/terraform/modules/pod-identity/variable.tf b/infra/terraform/modules/pod-identity/variable.tf
+index 86d4bac..517ddd7 100644
+--- a/infra/terraform/modules/pod-identity/variable.tf
++++ b/infra/terraform/modules/pod-identity/variable.tf
+@@ -29,6 +29,16 @@ variable "jwt_secret_arn" {
+   type        = string
+ }
+ 
++variable "admin_password_secret_arn" {
++  description = "ARN of the dashboard admin password secret"
++  type        = string
++}
++
++variable "carrier_webhook_secret_arn" {
++  description = "ARN of the carrier webhook signing secret"
++  type        = string
++}
++
+ variable "kms_key_arn" {
+   description = "ARN of the KMS key used to encrypt secrets"
+   type        = string
+diff --git a/infra/terraform/modules/secrets-manager/README.md b/infra/terraform/modules/secrets-manager/README.md
+index 61ddb3c..55c5ceb 100644
+--- a/infra/terraform/modules/secrets-manager/README.md
++++ b/infra/terraform/modules/secrets-manager/README.md
+@@ -11,6 +11,8 @@ application, encrypted using a customer-managed KMS key.
+ - KMS alias
+ - Grafana password secret
+ - api-gateway JWT signing secret (`<project>-<environment>-jwt-secret`)
++- Dashboard admin password (`<project>-<environment>-admin-password`), the value comes in through the `admin_password` input
++- Carrier webhook signing secret (`<project>-<environment>-carrier-webhook-secret`), the value comes in through the `carrier_webhook_secret` input
+ - Database credentials secret (`<project>-<environment>-db-credentials`), JSON `{"username", "password"}`
+ - Independently generated values for each secret
+ 
+@@ -33,6 +35,8 @@ The rds module reads the database password from this secret, so RDS and the apps
+ | db_username | RDS master username stored in the secret |
+ | grafana_password_secret_arn | ARN of the Grafana password secret |
+ | jwt_secret_arn | ARN of the api-gateway JWT signing secret |
++| admin_password_secret_arn | ARN of the dashboard admin password secret |
++| carrier_webhook_secret_arn | ARN of the carrier webhook signing secret |
+ | kms_key_arn | ARN of the KMS key used to encrypt secrets |
+ 
+ ## Local Testing
+diff --git a/infra/terraform/modules/secrets-manager/main.tf b/infra/terraform/modules/secrets-manager/main.tf
+index 84754d3..32fcbc8 100644
+--- a/infra/terraform/modules/secrets-manager/main.tf
++++ b/infra/terraform/modules/secrets-manager/main.tf
+@@ -47,6 +47,44 @@ resource "aws_secretsmanager_secret_version" "jwt_secret" {
+   secret_string_wo_version = 1
+ }
+ 
++# The dashboard admin password. The team picks it and the pipeline passes it in
++# (ADMIN_PASSWORD GitHub secret), so it is never in the repo and the same login comes
++# back after a full teardown. Write-only: it is not kept in state or in the plan file.
++# To change it: update the GitHub secret and raise secret_string_wo_version by 1.
++resource "aws_secretsmanager_secret" "admin_password" {
++  name       = "${var.project_name}-${var.environment}-admin-password"
++  kms_key_id = aws_kms_key.secret_encryption.arn
++
++  # dev only: delete immediately so destroy/apply cycles can reuse the name; prod keeps the default 30-day recovery window
++  recovery_window_in_days = 0
++}
++
++resource "aws_secretsmanager_secret_version" "admin_password" {
++  secret_id = aws_secretsmanager_secret.admin_password.id
++
++  secret_string_wo         = var.admin_password
++  secret_string_wo_version = 1
++}
++
++# The secret shared with the carrier to sign webhook calls. The carrier has to be given the
++# same value, so it cannot be random: the pipeline passes it in (CARRIER_WEBHOOK_SECRET
++# GitHub secret). Write-only, like the admin password; to change it, update the GitHub
++# secret and raise secret_string_wo_version by 1, and give the carrier the new value.
++resource "aws_secretsmanager_secret" "carrier_webhook_secret" {
++  name       = "${var.project_name}-${var.environment}-carrier-webhook-secret"
++  kms_key_id = aws_kms_key.secret_encryption.arn
++
++  # dev only: delete immediately so destroy/apply cycles can reuse the name; prod keeps the default 30-day recovery window
++  recovery_window_in_days = 0
++}
++
++resource "aws_secretsmanager_secret_version" "carrier_webhook_secret" {
++  secret_id = aws_secretsmanager_secret.carrier_webhook_secret.id
++
++  secret_string_wo         = var.carrier_webhook_secret
++  secret_string_wo_version = 1
++}
++
+ resource "aws_secretsmanager_secret" "db_credentials" {
+   name       = "${var.project_name}-${var.environment}-db-credentials"
+   kms_key_id = aws_kms_key.secret_encryption.arn
+diff --git a/infra/terraform/modules/secrets-manager/outputs.tf b/infra/terraform/modules/secrets-manager/outputs.tf
+index ac19611..a225f8e 100644
+--- a/infra/terraform/modules/secrets-manager/outputs.tf
++++ b/infra/terraform/modules/secrets-manager/outputs.tf
+@@ -13,6 +13,16 @@ output "jwt_secret_arn" {
+   value       = aws_secretsmanager_secret.jwt_secret.arn
+ }
+ 
++output "admin_password_secret_arn" {
++  description = "ARN of the dashboard admin password secret"
++  value       = aws_secretsmanager_secret.admin_password.arn
++}
++
++output "carrier_webhook_secret_arn" {
++  description = "ARN of the carrier webhook signing secret"
++  value       = aws_secretsmanager_secret.carrier_webhook_secret.arn
++}
++
+ output "db_credentials_secret_arn" {
+   description = "ARN of the database credentials secret"
+   value       = aws_secretsmanager_secret_version.db_credentials.secret_arn
+diff --git a/infra/terraform/modules/secrets-manager/variables.tf b/infra/terraform/modules/secrets-manager/variables.tf
+index 3af6d64..2da6308 100644
+--- a/infra/terraform/modules/secrets-manager/variables.tf
++++ b/infra/terraform/modules/secrets-manager/variables.tf
+@@ -13,3 +13,17 @@ variable "db_username" {
+   type        = string
+   default     = "dbadmin"
+ }
++
++variable "admin_password" {
++  description = "Password of the dashboard admin login, chosen by the team and given in by the pipeline"
++  type        = string
++  sensitive   = true
++  ephemeral   = true
++}
++
++variable "carrier_webhook_secret" {
++  description = "Secret shared with the shipping carrier to sign webhook calls, given in by the pipeline"
++  type        = string
++  sensitive   = true
++  ephemeral   = true
++}
+diff --git a/infra/terraform/modules/sqs/main.tf b/infra/terraform/modules/sqs/main.tf
+index 1163e73..8b913ce 100644
+--- a/infra/terraform/modules/sqs/main.tf
++++ b/infra/terraform/modules/sqs/main.tf
+@@ -38,3 +38,24 @@ resource "aws_sqs_queue_redrive_allow_policy" "order_events_dlq" {
+     sourceQueueArns   = [aws_sqs_queue.order_events.arn]
+   })
+ }
++
++# Fires when any message sits in the DLQ: an order event failed 3 times and its order is
++# stuck until someone looks (runbook: docs/sqs/dlq-runbook.md). AWS recommends
++# ApproximateNumberOfMessagesVisible for DLQs; NumberOfMessagesSent does not count messages
++# moved there by the redrive policy. A quiet queue sends no data points, which counts as
++# fine, not as an alarm.
++resource "aws_cloudwatch_metric_alarm" "order_events_dlq_not_empty" {
++  alarm_name          = "${var.project_name}-${var.environment}-order-events-dlq-not-empty"
++  alarm_description   = "Order events failed 3 times and are waiting in the DLQ. Runbook: docs/sqs/dlq-runbook.md"
++  namespace           = "AWS/SQS"
++  metric_name         = "ApproximateNumberOfMessagesVisible"
++  dimensions          = { QueueName = aws_sqs_queue.order_events_dlq.name }
++  statistic           = "Maximum"
++  period              = 300
++  evaluation_periods  = 1
++  threshold           = 1
++  comparison_operator = "GreaterThanOrEqualToThreshold"
++  treat_missing_data  = "notBreaching"
++  alarm_actions       = var.dlq_alarm_actions
++  ok_actions          = var.dlq_alarm_actions
++}
+diff --git a/infra/terraform/modules/sqs/output.tf b/infra/terraform/modules/sqs/output.tf
+index a5506d0..79441be 100644
+--- a/infra/terraform/modules/sqs/output.tf
++++ b/infra/terraform/modules/sqs/output.tf
+@@ -12,3 +12,8 @@ output "dlq_arn" {
+   description = "ARN of the order-events dead-letter queue"
+   value       = aws_sqs_queue.order_events_dlq.arn
+ }
++
++output "dlq_alarm_name" {
++  description = "Name of the CloudWatch alarm that fires when the DLQ is not empty"
++  value       = aws_cloudwatch_metric_alarm.order_events_dlq_not_empty.alarm_name
++}
+diff --git a/infra/terraform/modules/sqs/variable.tf b/infra/terraform/modules/sqs/variable.tf
+index b1a19ad..f2660c7 100644
+--- a/infra/terraform/modules/sqs/variable.tf
++++ b/infra/terraform/modules/sqs/variable.tf
+@@ -8,3 +8,9 @@ variable "environment" {
+   description = "Environment name (dev, staging, prod)"
+   type        = string
+ }
++
++variable "dlq_alarm_actions" {
++  description = "Where the DLQ alarm notifies (for example an SNS topic ARN). Empty: the alarm only shows in CloudWatch"
++  type        = list(string)
++  default     = []
++}
+diff --git a/infra/terraform/variable.tf b/infra/terraform/variable.tf
+index 62ec171..5274d1c 100644
+--- a/infra/terraform/variable.tf
++++ b/infra/terraform/variable.tf
+@@ -62,3 +62,23 @@ variable "route53_hosted_zone_name" {
+   type        = string
+   default     = "eksv2.naimaosmann.com"
+ }
++
++variable "admin_password" {
++  description = "Password of the dashboard admin login. Given to Terraform by the pipeline (TF_VAR_admin_password, from the ADMIN_PASSWORD GitHub secret), never committed."
++  type        = string
++  sensitive   = true
++  ephemeral   = true
++}
++
++variable "carrier_webhook_secret" {
++  description = "Secret shared with the shipping carrier to sign webhook calls. Given to Terraform by the pipeline (TF_VAR_carrier_webhook_secret, from the CARRIER_WEBHOOK_SECRET GitHub secret), never committed."
++  type        = string
++  sensitive   = true
++  ephemeral   = true
++}
++
++variable "dlq_alarm_actions" {
++  description = "ARNs notified when the dead-letter queue is not empty (for example an SNS topic). Empty: the alarm only shows in CloudWatch. Set per environment."
++  type        = list(string)
++  default     = []
++}
+diff --git a/kubernetes/deploy/envs/dev/api-gateway.yaml b/kubernetes/deploy/envs/dev/api-gateway.yaml
+index f87a63a..558c659 100644
+--- a/kubernetes/deploy/envs/dev/api-gateway.yaml
++++ b/kubernetes/deploy/envs/dev/api-gateway.yaml
+@@ -14,6 +14,9 @@ externalSecrets:
+   env:
+     - name: JWT_SECRET
+       key: eks-v2-dev-jwt-secret
++    # Written by Terraform from the ADMIN_PASSWORD GitHub secret
++    - name: ADMIN_PASSWORD
++      key: eks-v2-dev-admin-password
+ 
+ ingressRoute:
+   enabled: true
+diff --git a/kubernetes/deploy/envs/dev/shipping-service.yaml b/kubernetes/deploy/envs/dev/shipping-service.yaml
+index af6ffbc..820a70c 100644
+--- a/kubernetes/deploy/envs/dev/shipping-service.yaml
++++ b/kubernetes/deploy/envs/dev/shipping-service.yaml
+@@ -3,3 +3,9 @@ image:
+   tag: shipping-service-47c3184a
+ 
+ replicaCount: 1
++
++externalSecrets:
++  env:
++    # Written by Terraform from the CARRIER_WEBHOOK_SECRET GitHub secret (never in this repo).
++    - name: CARRIER_WEBHOOK_SECRET
++      key: eks-v2-dev-carrier-webhook-secret
+diff --git a/kubernetes/deploy/services/api-gateway/values.yaml b/kubernetes/deploy/services/api-gateway/values.yaml
+index 8427406..7cf3b4e 100644
+--- a/kubernetes/deploy/services/api-gateway/values.yaml
++++ b/kubernetes/deploy/services/api-gateway/values.yaml
+@@ -5,6 +5,8 @@ metricsPort: 9090
+ 
+ env:
+   REDIS_URL: redis://redis:6379
++  # The one dashboard login. Its password comes from Secrets Manager (see envs/<env>/api-gateway.yaml).
++  ADMIN_EMAIL: admin@platform.local
+ 
+ # JWT_SECRET key is environment-specific: see kubernetes/deploy/envs/<env>/api-gateway.yaml
+ 
+diff --git a/services/api-gateway/main.go b/services/api-gateway/main.go
+index b302e34..f0965bf 100644
+--- a/services/api-gateway/main.go
++++ b/services/api-gateway/main.go
+@@ -3,6 +3,7 @@ package main
+ import (
+ 	"context"
+ 	"crypto/sha256"
++	"crypto/subtle"
+ 	"encoding/hex"
+ 	"encoding/json"
+ 	"errors"
+@@ -33,8 +34,12 @@ var (
+ 	redisClient *redis.Client
+ 	ctx         = context.Background()
+ 	jwtSecret   []byte
+-	routes      map[string]string
+-	rlConfig    rateLimitConfig
++	adminEmail  string
++	adminDigest [32]byte // SHA-256 of the admin password; the password itself is not kept
++	// false when ADMIN_PASSWORD is missing: then nobody can log in
++	adminConfigured bool
++	routes          map[string]string
++	rlConfig        rateLimitConfig
+ )
+ 
+ func main() {
+@@ -45,6 +50,17 @@ func main() {
+ 	}
+ 	jwtSecret = []byte(secret)
+ 
++	// The dashboard has one admin account. The password comes from a secret (Secrets
++	// Manager on EKS), never from the code. Without it login refuses everyone, but the
++	// gateway still starts, so a secret that arrives late doesn't take the API down.
++	adminEmail = getEnv("ADMIN_EMAIL", "admin@platform.local")
++	if password := os.Getenv("ADMIN_PASSWORD"); password != "" {
++		adminDigest = sha256.Sum256([]byte(password))
++		adminConfigured = true
++	} else {
++		log.Println("WARNING: ADMIN_PASSWORD not set, every login is refused")
++	}
++
+ 	var err error
+ 	rlConfig, err = loadRateLimitConfig()
+ 	if err != nil {
+@@ -133,11 +149,15 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
+-	// In production this would validate against a user database
+-	// For this project, accept any email/password and return a JWT
++	if !isAdmin(req.Email, req.Password) {
++		// Same answer for a wrong email and a wrong password, so the email can't be guessed.
++		httpError(w, "invalid email or password", http.StatusUnauthorized)
++		return
++	}
++
+ 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+-		"sub":  req.Email,
+-		"role": "customer",
++		"sub":  adminEmail,
++		"role": "admin",
+ 		"exp":  time.Now().Add(24 * time.Hour).Unix(),
+ 		"iat":  time.Now().Unix(),
+ 	})
+@@ -152,6 +172,9 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
+ 	json.NewEncoder(w).Encode(map[string]string{"token": tokenString})
+ }
+ 
++// handleRegister is closed. The only user interface is the admin dashboard, and an
++// open register endpoint handed a valid token to anyone who asked for one.
++// Customer accounts need a user store with hashed passwords first (see the app docs).
+ func handleRegister(w http.ResponseWriter, r *http.Request) {
+ 	if r.Method != http.MethodPost {
+ 		httpError(w, "method not allowed", http.StatusMethodNotAllowed)
+@@ -160,47 +183,25 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
+ 	if rateLimited(w, r, scopeSensitive, clientIP(r), rlConfig.sensitiveLimit) {
+ 		return
+ 	}
++	httpError(w, "registration is closed", http.StatusForbidden)
++}
+ 
+-	var req struct {
+-		Email    string `json:"email"`
+-		Password string `json:"password"`
+-		Name     string `json:"name"`
+-	}
+-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+-		httpError(w, "invalid request body", http.StatusBadRequest)
+-		return
+-	}
+-
+-	if req.Email == "" || req.Password == "" {
+-		httpError(w, "email and password required", http.StatusBadRequest)
+-		return
+-	}
+-
+-	// Return a JWT for the new user
+-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+-		"sub":  req.Email,
+-		"name": req.Name,
+-		"role": "customer",
+-		"exp":  time.Now().Add(24 * time.Hour).Unix(),
+-		"iat":  time.Now().Unix(),
+-	})
+-
+-	tokenString, err := token.SignedString(jwtSecret)
+-	if err != nil {
+-		httpError(w, "failed to generate token", http.StatusInternalServerError)
+-		return
+-	}
+-
+-	w.Header().Set("Content-Type", "application/json")
+-	w.WriteHeader(http.StatusCreated)
+-	json.NewEncoder(w).Encode(map[string]interface{}{
+-		"message": "registered",
+-		"email":   req.Email,
+-		"token":   tokenString,
+-	})
++// isAdmin checks the login against the admin account. Both sides are hashed to the same
++// length and compared in constant time, so the response time says nothing about how
++// much of the password was right.
++func isAdmin(email, password string) bool {
++	given := sha256.Sum256([]byte(password))
++	emailOK := subtle.ConstantTimeCompare([]byte(strings.ToLower(strings.TrimSpace(email))), []byte(strings.ToLower(adminEmail))) == 1
++	passwordOK := subtle.ConstantTimeCompare(given[:], adminDigest[:]) == 1
++	return adminConfigured && emailOK && passwordOK
+ }
+ 
+ func handleProxy(w http.ResponseWriter, r *http.Request) {
++	// These headers tell services who is calling. Only the gateway may set them, from a
++	// checked token, so anything a client sent under these names is dropped first.
++	r.Header.Del("X-User-Email")
++	r.Header.Del("X-User-Role")
++
+ 	if isPublicPath(r.URL.Path) {
+ 		// Anonymous traffic is limited per client IP; sensitive routes (webhook) more strictly.
+ 		scope, limit := scopeIP, rlConfig.ipLimit
+@@ -213,6 +214,12 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
+ 	} else {
+ 		claims, err := validateToken(r)
+ 		if err != nil {
++			// A missing or bad token is counted per client IP, so guessing tokens or probing
++			// protected routes gets a 429 after a few tries. Good tokens are never counted,
++			// so an attacker cannot use this to lock out real users who share the IP.
++			if rateLimited(w, r, scopeBadToken, clientIP(r), rlConfig.sensitiveLimit) {
++				return
++			}
+ 			httpError(w, "unauthorized: "+err.Error(), http.StatusUnauthorized)
+ 			return
+ 		}
+@@ -279,7 +286,13 @@ func forward(w http.ResponseWriter, r *http.Request, targetURL string) {
+ 		httpError(w, "service unavailable", http.StatusBadGateway)
+ 	}
+ 
+-	r.Header.Set("X-Forwarded-For", r.RemoteAddr)
++	// Pass the real client on to the services. From a trusted proxy (Traefik) the incoming
++	// X-Forwarded-For chain is kept and ReverseProxy appends this hop to it. From anyone
++	// else the header is dropped, because a client could have written it.
++	if !fromTrustedProxy(r) {
++		r.Header.Del("X-Forwarded-For")
++	}
++	r.Header.Set("X-Real-IP", clientIP(r))
+ 	r.Header.Set("X-Request-ID", fmt.Sprintf("%d", time.Now().UnixNano()))
+ 
+ 	proxy.ServeHTTP(w, r)
+@@ -364,6 +377,7 @@ const (
+ 	scopeUser      = "user"      // authenticated traffic, keyed by JWT subject
+ 	scopeIP        = "ip"        // anonymous traffic, keyed by client IP
+ 	scopeSensitive = "sensitive" // login/register/webhook, keyed by client IP, stricter
++	scopeBadToken  = "badtoken"  // missing or invalid token on a protected route, keyed by client IP
+ )
+ 
+ // Each Redis call gets a short deadline so a slow Redis cannot stall requests;
+@@ -446,6 +460,16 @@ func isTrustedProxy(ip net.IP) bool {
+ 	return false
+ }
+ 
++// fromTrustedProxy reports whether the direct peer of this request is a trusted proxy.
++func fromTrustedProxy(r *http.Request) bool {
++	host := r.RemoteAddr
++	if h, _, err := net.SplitHostPort(host); err == nil {
++		host = h
++	}
++	ip := net.ParseIP(host)
++	return ip != nil && isTrustedProxy(ip)
++}
++
+ // clientIP returns the caller's IP without the port.
+ // Forwarding headers are only believed when the direct peer is a trusted proxy;
+ // otherwise any client could claim any IP. With a trusted proxy, X-Forwarded-For
+diff --git a/services/api-gateway/main_test.go b/services/api-gateway/main_test.go
+index b504a71..e2133eb 100644
+--- a/services/api-gateway/main_test.go
++++ b/services/api-gateway/main_test.go
+@@ -163,12 +163,12 @@ func TestSensitiveRoutesAreLimitedPerIPWithStricterLimit(t *testing.T) {
+ 	fakeUpstream(t)
+ 	setLimits(t, 100, 100, 2, "")
+ 
+-	// Login: different emails and ports from one IP share the stricter budget.
++	// Login: different ports from one IP share the stricter budget.
+ 	codes := []int{}
+ 	for i := 1; i <= 3; i++ {
+ 		rec := httptest.NewRecorder()
+ 		handleLogin(rec, request("POST", "/auth/login", fmt.Sprintf("203.0.113.5:%d", 40000+i),
+-			fmt.Sprintf(`{"email":"user%d@test.com","password":"x"}`, i)))
++			fmt.Sprintf(`{"email":"admin@test.com","password":"%s"}`, testAdminPassword)))
+ 		codes = append(codes, rec.Code)
+ 	}
+ 	if codes[0] != 200 || codes[1] != 200 || codes[2] != http.StatusTooManyRequests {
+@@ -176,7 +176,7 @@ func TestSensitiveRoutesAreLimitedPerIPWithStricterLimit(t *testing.T) {
+ 	}
+ 	// A different IP is unaffected.
+ 	rec := httptest.NewRecorder()
+-	handleLogin(rec, request("POST", "/auth/login", "203.0.113.6:40000", `{"email":"x@test.com","password":"x"}`))
++	handleLogin(rec, request("POST", "/auth/login", "203.0.113.6:40000", adminLogin))
+ 	if rec.Code != http.StatusOK {
+ 		t.Fatalf("login from another IP: want 200, got %d", rec.Code)
+ 	}
+@@ -230,10 +230,10 @@ func TestCounterIsAtomicAndAlwaysHasExpiry(t *testing.T) {
+ func TestBlockedResponseHasRetryAfter(t *testing.T) {
+ 	useTestRedis(t)
+ 	setLimits(t, 100, 100, 1, "")
+-	handleLogin(httptest.NewRecorder(), request("POST", "/auth/login", "203.0.113.20:1", `{"email":"a@b.c","password":"x"}`))
++	handleLogin(httptest.NewRecorder(), request("POST", "/auth/login", "203.0.113.20:1", adminLogin))
+ 
+ 	rec := httptest.NewRecorder()
+-	handleLogin(rec, request("POST", "/auth/login", "203.0.113.20:2", `{"email":"a@b.c","password":"x"}`))
++	handleLogin(rec, request("POST", "/auth/login", "203.0.113.20:2", adminLogin))
+ 	if rec.Code != http.StatusTooManyRequests {
+ 		t.Fatalf("want 429, got %d", rec.Code)
+ 	}
+diff --git a/services/dashboard-api/static/index.html b/services/dashboard-api/static/index.html
+index fbd503e..8d0d1ec 100644
+--- a/services/dashboard-api/static/index.html
++++ b/services/dashboard-api/static/index.html
+@@ -65,12 +65,24 @@
+         .refresh { float: right; font-size: 0.8rem; color: #8b949e; cursor: pointer; }
+         .refresh:hover { color: #e1e4e8; }
+ 
++        /* Until someone logs in, only the login box is shown. */
++        #login-box { max-width: 360px; margin: 80px auto; display: none; }
++        body.locked #login-box { display: block; }
++        body.locked .container > :not(#login-box) { display: none; }
++
+         #toast { position: fixed; bottom: 20px; right: 20px; padding: 12px 20px; border-radius: 6px; background: #238636; color: #fff; font-size: 0.85rem; display: none; z-index: 100; }
+         #toast.error { background: #f85149; }
+     </style>
+ </head>
+-<body>
++<body class="locked">
+     <div class="container">
++        <form id="login-box" class="section">
++            <h2>Admin login</h2>
++            <div class="form-row"><input type="email" id="login-email" placeholder="Email" autocomplete="username" required></div>
++            <div class="form-row"><input type="password" id="login-password" placeholder="Password" autocomplete="current-password" required></div>
++            <button class="btn btn-primary" type="submit" id="login-button">Log in</button>
++        </form>
++
+         <h1>Order Fulfillment Platform <span class="refresh" onclick="refreshAll()">refresh</span></h1>
+ 
+         <div class="grid" id="stats"></div>
+@@ -93,6 +105,16 @@
+                     <input type="number" id="order-qty" placeholder="Qty" value="1" min="1" style="max-width:80px">
+                     <button class="btn btn-primary" id="place-order" onclick="createOrder()">Place Order</button>
+                 </div>
++                <div class="form-row">
++                    <input type="text" id="addr-name" placeholder="Recipient name" maxlength="255" autocomplete="off">
++                    <input type="text" id="addr-line1" placeholder="Address line 1" maxlength="255" autocomplete="off">
++                    <input type="text" id="addr-line2" placeholder="Address line 2 (optional)" maxlength="255" autocomplete="off">
++                </div>
++                <div class="form-row">
++                    <input type="text" id="addr-city" placeholder="City" maxlength="100" autocomplete="off">
++                    <input type="text" id="addr-postcode" placeholder="Postcode" maxlength="20" autocomplete="off">
++                    <input type="text" id="addr-country" placeholder="Country (2 letters)" value="GB" maxlength="2" style="max-width:120px" autocomplete="off">
++                </div>
+             </div>
+             <div class="section">
+                 <h2>Orders</h2>
+@@ -181,18 +203,56 @@
+         const API = window.location.origin;
+         let token = '';
+ 
+-        // Tokens last 24h, so log in on every page load instead of reusing a stored one.
+-        function login() {
+-            return fetch(API + '/auth/login', {
+-                method: 'POST',
+-                headers: { 'Content-Type': 'application/json' },
+-                body: JSON.stringify({ email: 'admin@platform.local', password: 'admin' })
+-            })
+-            .then(r => r.json())
+-            .then(d => { token = d.token || ''; })
+-            .catch(() => {});
++        // One admin login. The token lives in memory only, so a reload asks again, and a
++        // token that expires (24h) or is refused brings the login box back.
++        const realFetch = window.fetch.bind(window);
++        window.fetch = async (...args) => {
++            const r = await realFetch(...args);
++            // Only a call that carried our token and was refused means "log in again".
++            const sent = args[1] && args[1].headers && args[1].headers.Authorization;
++            if (r.status === 401 && sent) showLogin();
++            return r;
++        };
++
++        let refreshTimer;
++        function showLogin() {
++            token = '';
++            clearInterval(refreshTimer);
++            document.body.classList.add('locked');
+         }
+ 
++        document.getElementById('login-box').addEventListener('submit', async (e) => {
++            e.preventDefault();
++            const button = document.getElementById('login-button');
++            button.disabled = true;
++            try {
++                const r = await realFetch(API + '/auth/login', {
++                    method: 'POST',
++                    headers: { 'Content-Type': 'application/json' },
++                    body: JSON.stringify({
++                        email: document.getElementById('login-email').value,
++                        password: document.getElementById('login-password').value
++                    })
++                });
++                const d = await r.json().catch(() => ({}));
++                if (r.ok && d.token) {
++                    token = d.token;
++                    document.getElementById('login-password').value = '';
++                    document.body.classList.remove('locked');
++                    refreshAll();
++                    refreshTimer = setInterval(refreshAll, 30000);
++                } else if (r.status === 429) {
++                    toast('Too many attempts. Wait a minute and try again.', true);
++                } else {
++                    toast('Wrong email or password.', true);
++                }
++            } catch (err) {
++                toast('Could not reach the server.', true);
++            } finally {
++                button.disabled = false;
++            }
++        });
++
+         function headers() {
+             return { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token };
+         }
+@@ -292,7 +352,17 @@
+             const qty = parseInt(document.getElementById('order-qty').value) || 1;
+             if (!product) { toast('Pick a product', true); return; }
+ 
+-            const body = JSON.stringify({ items: [{ product_id: product, quantity: qty }] });
++            // Where the parcel goes. order-service checks every field again; this only saves a round trip.
++            const val = id => document.getElementById(id).value.trim();
++            const shipping_address = {
++                name: val('addr-name'), line1: val('addr-line1'), line2: val('addr-line2'),
++                city: val('addr-city'), postcode: val('addr-postcode'), country: val('addr-country') || 'GB'
++            };
++            if (!shipping_address.name || !shipping_address.line1 || !shipping_address.city || !shipping_address.postcode) {
++                toast('Enter the recipient name, address line 1, city and postcode', true); return;
++            }
++
++            const body = JSON.stringify({ items: [{ product_id: product, quantity: qty }], shipping_address });
+             const key = lastAttempt && lastAttempt.body === body ? lastAttempt.key : newKey();
+             lastAttempt = { body, key };
+ 
+@@ -484,13 +554,8 @@
+             loadServices();
+         }
+ 
+-        // Load data only once logged in. Auto-refresh every 30s: all tabs share one login,
+-        // so one rate-limit bucket. Log in again every hour so an open tab never expires.
+-        login().then(() => {
+-            refreshAll();
+-            setInterval(refreshAll, 30000);
+-        });
+-        setInterval(login, 60 * 60 * 1000);
++        // Data loads after login (see the login form above) and refreshes every 30s. All tabs
++        // share one login, so one rate-limit bucket.
+     </script>
+ </body>
+ </html>
+diff --git a/services/order-service/idempotency.go b/services/order-service/idempotency.go
+index e05bd72..f91803b 100644
+--- a/services/order-service/idempotency.go
++++ b/services/order-service/idempotency.go
+@@ -27,16 +27,19 @@ const maxIdempotencyKeyLen = 255
+ // requestFingerprint is a hash of what the customer asked for (products, quantities,
+ // currency, notes). The client's own price is left out because it is ignored anyway.
+ // It lets us tell "the same request again" from "a different request reusing the key".
+-func requestFingerprint(items []OrderItem, currency, notes string) string {
++func requestFingerprint(items []OrderItem, currency, notes string, address *Address) string {
+ 	type line struct {
+ 		ProductID string `json:"p"`
+ 		Quantity  int    `json:"q"`
+ 	}
++	// The address is left out when there is none, so a request without one hashes
++	// exactly as it did before addresses existed (keys stored then still match).
+ 	canonical := struct {
+-		Items    []line `json:"items"`
+-		Currency string `json:"currency"`
+-		Notes    string `json:"notes"`
+-	}{Currency: currency, Notes: notes}
++		Items    []line   `json:"items"`
++		Currency string   `json:"currency"`
++		Notes    string   `json:"notes"`
++		Address  *Address `json:"address,omitempty"`
++	}{Currency: currency, Notes: notes, Address: address}
+ 	for _, it := range items {
+ 		canonical.Items = append(canonical.Items, line{it.ProductID, it.Quantity})
+ 	}
+diff --git a/services/order-service/main.go b/services/order-service/main.go
+index cb96bdd..efe8085 100644
+--- a/services/order-service/main.go
++++ b/services/order-service/main.go
+@@ -26,14 +26,50 @@ type Order struct {
+ 	Total      float64         `json:"total"`
+ 	Currency   string          `json:"currency"`
+ 	Notes      string          `json:"notes,omitempty"`
+-	CreatedAt  string          `json:"created_at"`
+-	UpdatedAt  string          `json:"updated_at"`
++	// Where the parcel goes. Empty for orders placed before addresses existed.
++	ShippingAddress json.RawMessage `json:"shipping_address,omitempty"`
++	CreatedAt       string          `json:"created_at"`
++	UpdatedAt       string          `json:"updated_at"`
+ }
+ 
+ type CreateOrderRequest struct {
+-	Items    []OrderItem `json:"items"`
+-	Currency string      `json:"currency"`
+-	Notes    string      `json:"notes,omitempty"`
++	Items           []OrderItem `json:"items"`
++	Currency        string      `json:"currency"`
++	Notes           string      `json:"notes,omitempty"`
++	ShippingAddress *Address    `json:"shipping_address,omitempty"`
++}
++
++// Address is where an order is shipped. The limits match the shipments table, so
++// anything accepted here also fits the shipment the worker creates from it.
++type Address struct {
++	Name     string `json:"name"`
++	Line1    string `json:"line1"`
++	Line2    string `json:"line2,omitempty"`
++	City     string `json:"city"`
++	Postcode string `json:"postcode"`
++	Country  string `json:"country"`
++}
++
++// validate trims the fields, fills the default country and says what is wrong, if anything.
++func (a *Address) validate() string {
++	for _, f := range []*string{&a.Name, &a.Line1, &a.Line2, &a.City, &a.Postcode, &a.Country} {
++		*f = strings.TrimSpace(*f)
++	}
++	if a.Country == "" {
++		a.Country = "GB"
++	}
++	a.Country = strings.ToUpper(a.Country)
++	switch {
++	case a.Name == "" || a.Line1 == "" || a.City == "" || a.Postcode == "":
++		return "shipping_address needs name, line1, city and postcode"
++	case len(a.Name) > 255 || len(a.Line1) > 255 || len(a.Line2) > 255:
++		return "shipping_address name and lines must be 255 characters or fewer"
++	case len(a.City) > 100 || len(a.Postcode) > 20:
++		return "shipping_address city must be 100 characters or fewer and postcode 20 or fewer"
++	case len(a.Country) != 2 || strings.Trim(a.Country, "ABCDEFGHIJKLMNOPQRSTUVWXYZ") != "":
++		return "shipping_address country must be a 2-letter code such as GB"
++	}
++	return ""
+ }
+ 
+ type OrderItem struct {
+@@ -147,6 +183,8 @@ func migrate() {
+ 			updated_at TIMESTAMP DEFAULT NOW()
+ 		)`,
+ 		`CREATE INDEX IF NOT EXISTS idx_orders_customer ON orders(customer_id)`,
++		// Added after launch, so older orders have none (NULL).
++		`ALTER TABLE orders ADD COLUMN IF NOT EXISTS shipping_address JSONB`,
+ 		`CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)`,
+ 		`CREATE TABLE IF NOT EXISTS order_events (
+ 			id SERIAL PRIMARY KEY,
+@@ -254,9 +292,19 @@ func createOrder(w http.ResponseWriter, r *http.Request) {
+ 		currency = "GBP"
+ 	}
+ 
++	var addressJSON interface{} // stays nil (SQL NULL) when no address was sent
++	if req.ShippingAddress != nil {
++		if msg := req.ShippingAddress.validate(); msg != "" {
++			httpError(w, msg, http.StatusBadRequest)
++			return
++		}
++		b, _ := json.Marshal(req.ShippingAddress)
++		addressJSON = string(b)
++	}
++
+ 	// A key we have already seen is answered from what we stored, before pricing, so a
+ 	// retry still works while inventory is down.
+-	fingerprint := requestFingerprint(req.Items, currency, req.Notes)
++	fingerprint := requestFingerprint(req.Items, currency, req.Notes, req.ShippingAddress)
+ 	if replayIfSeen(w, customerID, idemKey, fingerprint) {
+ 		return
+ 	}
+@@ -311,9 +359,9 @@ func createOrder(w http.ResponseWriter, r *http.Request) {
+ 
+ 	var orderID int
+ 	err = tx.QueryRow(
+-		`INSERT INTO orders (customer_id, status, items, total, currency, notes)
+-		 VALUES ($1, 'pending', $2, $3, $4, $5) RETURNING id`,
+-		customerID, itemsJSON, total, currency, req.Notes,
++		`INSERT INTO orders (customer_id, status, items, total, currency, notes, shipping_address)
++		 VALUES ($1, 'pending', $2, $3, $4, $5, $6) RETURNING id`,
++		customerID, itemsJSON, total, currency, req.Notes, addressJSON,
+ 	).Scan(&orderID)
+ 	if err != nil {
+ 		log.Printf("Create order error: %v", err)
+@@ -373,7 +421,7 @@ func listOrders(w http.ResponseWriter, r *http.Request) {
+ 	customerID := r.Header.Get("X-User-Email")
+ 	status := r.URL.Query().Get("status")
+ 
+-	query := "SELECT id, customer_id, status, items, total, currency, notes, created_at, updated_at FROM orders WHERE 1=1"
++	query := "SELECT id, customer_id, status, items, total, currency, notes, shipping_address, created_at, updated_at FROM orders WHERE 1=1"
+ 	args := []interface{}{}
+ 	argN := 1
+ 
+@@ -399,10 +447,12 @@ func listOrders(w http.ResponseWriter, r *http.Request) {
+ 	orders := []Order{}
+ 	for rows.Next() {
+ 		var o Order
+-		if err := rows.Scan(&o.ID, &o.CustomerID, &o.Status, &o.Items, &o.Total, &o.Currency, &o.Notes, &o.CreatedAt, &o.UpdatedAt); err != nil {
++		var addr []byte
++		if err := rows.Scan(&o.ID, &o.CustomerID, &o.Status, &o.Items, &o.Total, &o.Currency, &o.Notes, &addr, &o.CreatedAt, &o.UpdatedAt); err != nil {
+ 			httpError(w, "scan failed", http.StatusInternalServerError)
+ 			return
+ 		}
++		o.ShippingAddress = addr
+ 		orders = append(orders, o)
+ 	}
+ 	if err := rows.Err(); err != nil {
+@@ -416,10 +466,12 @@ func listOrders(w http.ResponseWriter, r *http.Request) {
+ 
+ func getOrder(w http.ResponseWriter, r *http.Request, id string) {
+ 	var o Order
++	var addr []byte
+ 	err := db.QueryRow(
+-		"SELECT id, customer_id, status, items, total, currency, notes, created_at, updated_at FROM orders WHERE id = $1",
++		"SELECT id, customer_id, status, items, total, currency, notes, shipping_address, created_at, updated_at FROM orders WHERE id = $1",
+ 		id,
+-	).Scan(&o.ID, &o.CustomerID, &o.Status, &o.Items, &o.Total, &o.Currency, &o.Notes, &o.CreatedAt, &o.UpdatedAt)
++	).Scan(&o.ID, &o.CustomerID, &o.Status, &o.Items, &o.Total, &o.Currency, &o.Notes, &addr, &o.CreatedAt, &o.UpdatedAt)
++	o.ShippingAddress = addr
+ 
+ 	if err != nil {
+ 		httpError(w, "order not found", http.StatusNotFound)
+diff --git a/services/payment-service/main.go b/services/payment-service/main.go
+index 1ce1772..aa5c862 100644
+--- a/services/payment-service/main.go
++++ b/services/payment-service/main.go
+@@ -573,7 +573,7 @@ func publishEvent(eventType string, payload map[string]interface{}) {
+ 		"timestamp": time.Now().UTC().Format(time.RFC3339),
+ 	}
+ 	data, _ := json.Marshal(event)
+-	log.Printf("Event -> SQS: %s", string(data))
++	log.Printf("Event (logged only): %s", string(data))
+ }
+ 
+ func httpError(w http.ResponseWriter, msg string, code int) {
+diff --git a/services/shipping-service/main.go b/services/shipping-service/main.go
+index 508010c..25aa22a 100644
+--- a/services/shipping-service/main.go
++++ b/services/shipping-service/main.go
+@@ -2,9 +2,13 @@ package main
+ 
+ import (
+ 	"context"
++	"crypto/hmac"
++	"crypto/sha256"
+ 	"database/sql"
++	"encoding/hex"
+ 	"encoding/json"
+ 	"fmt"
++	"io"
+ 	"log"
+ 	"math/rand"
+ 	"net/http"
+@@ -39,6 +43,13 @@ func main() {
+ 	waitForDB()
+ 	migrate()
+ 
++	// The carrier signs every webhook call with this shared secret (see verifyCarrierSignature).
++	// Without it the webhook refuses every call rather than trusting anyone.
++	webhookSecret = []byte(os.Getenv("CARRIER_WEBHOOK_SECRET"))
++	if len(webhookSecret) == 0 {
++		log.Println("WARNING: CARRIER_WEBHOOK_SECRET not set, the carrier webhook refuses every call")
++	}
++
+     startMetricsServer(getEnv("METRICS_PORT", "9090"))  
+ 	mux := http.NewServeMux()
+ 	mux.HandleFunc("/livez", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
+@@ -533,19 +544,34 @@ func handleCarrierWebhook(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
++	// The signature covers the exact bytes sent, so read the body once (64 KB at most) and
++	// check it before parsing anything.
++	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 64<<10))
++	if err != nil {
++		httpError(w, "invalid request body", http.StatusBadRequest)
++		return
++	}
++	if len(webhookSecret) == 0 {
++		httpError(w, "webhook not configured", http.StatusServiceUnavailable)
++		return
++	}
++	if !verifyCarrierSignature(r.Header.Get("X-Carrier-Signature"), body) {
++		httpError(w, "invalid signature", http.StatusUnauthorized)
++		return
++	}
++
+ 	var req struct {
+ 		TrackingNumber string `json:"tracking_number"`
+ 		Status         string `json:"status"`
+ 		Location       string `json:"location"`
+ 		Description    string `json:"description"`
+ 	}
+-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
++	if err := json.Unmarshal(body, &req); err != nil {
+ 		httpError(w, "invalid request body", http.StatusBadRequest)
+ 		return
+ 	}
+ 
+-	// The webhook is open to the internet, so it only accepts what a carrier can really
+-	// report. Cancelling is our own decision (the order was cancelled), never the carrier's.
++	// Even a signed call only gets what a carrier can really report. Cancelling is our own decision (the order was cancelled), never the carrier's.
+ 	if req.TrackingNumber == "" {
+ 		httpError(w, "tracking_number is required", http.StatusBadRequest)
+ 		return
+@@ -556,7 +582,7 @@ func handleCarrierWebhook(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 
+ 	var orderID int
+-	err := db.QueryRow(
++	err = db.QueryRow(
+ 		"SELECT order_id FROM shipments WHERE tracking_number = $1",
+ 		req.TrackingNumber,
+ 	).Scan(&orderID)
+@@ -570,6 +596,30 @@ func handleCarrierWebhook(w http.ResponseWriter, r *http.Request) {
+ 	moveShipmentByOrder(w, orderID, req.Status, req.Location, req.Description)
+ }
+ 
++// webhookSecret is shared with the carrier. Only someone holding it can sign a call.
++var webhookSecret []byte
++
++// verifyCarrierSignature checks the X-Carrier-Signature header: "sha256=" followed by the
++// hex HMAC-SHA256 of the raw body, keyed with the shared secret (the scheme GitHub uses
++// for its webhooks). hmac.Equal compares in constant time, so a caller can't learn the
++// right signature byte by byte from response times.
++//
++// There is no timestamp in the signature, so a captured call could be sent again. That is
++// harmless here: a shipment only ever moves forward and a repeat changes nothing.
++func verifyCarrierSignature(header string, body []byte) bool {
++	got, ok := strings.CutPrefix(header, "sha256=")
++	if !ok {
++		return false
++	}
++	sig, err := hex.DecodeString(got)
++	if err != nil {
++		return false
++	}
++	mac := hmac.New(sha256.New, webhookSecret)
++	mac.Write(body)
++	return hmac.Equal(sig, mac.Sum(nil))
++}
++
+ func orDefault(v, fallback string) string {
+ 	if v == "" {
+ 		return fallback
+@@ -602,7 +652,7 @@ func publishEvent(eventType string, payload map[string]interface{}) {
+ 		"timestamp": time.Now().UTC().Format(time.RFC3339),
+ 	}
+ 	data, _ := json.Marshal(event)
+-	log.Printf("Event -> SQS: %s", string(data))
++	log.Printf("Event (logged only): %s", string(data))
+ }
+ 
+ func httpError(w http.ResponseWriter, msg string, code int) {
+diff --git a/services/shipping-service/main_test.go b/services/shipping-service/main_test.go
+index 9ad122b..736322e 100644
+--- a/services/shipping-service/main_test.go
++++ b/services/shipping-service/main_test.go
+@@ -10,12 +10,17 @@ package main
+ 
+ import (
+ 	"bytes"
++	"crypto/hmac"
++	"crypto/sha256"
+ 	"database/sql"
++	"encoding/hex"
+ 	"encoding/json"
++	"fmt"
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"os"
+ 	"strconv"
++	"strings"
+ 	"sync"
+ 	"testing"
+ )
+@@ -250,10 +255,29 @@ func TestConcurrentMovesRecordOneEvent(t *testing.T) {
+ 
+ // --- Carrier webhook (open to the internet through the gateway) ---
+ 
++const testWebhookSecret = "test-carrier-secret"
++
++func sign(secret, body string) string {
++	mac := hmac.New(sha256.New, []byte(secret))
++	mac.Write([]byte(body))
++	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
++}
++
++// webhook sends a call signed the way the carrier signs it.
+ func webhook(t *testing.T, body string) (int, map[string]interface{}) {
+ 	t.Helper()
++	return webhookWithSignature(t, body, sign(testWebhookSecret, body))
++}
++
++func webhookWithSignature(t *testing.T, body, signature string) (int, map[string]interface{}) {
++	t.Helper()
++	webhookSecret = []byte(testWebhookSecret)
+ 	rec := httptest.NewRecorder()
+-	handleCarrierWebhook(rec, httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewBufferString(body)))
++	req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewBufferString(body))
++	if signature != "" {
++		req.Header.Set("X-Carrier-Signature", signature)
++	}
++	handleCarrierWebhook(rec, req)
+ 	var resp map[string]interface{}
+ 	json.NewDecoder(rec.Body).Decode(&resp)
+ 	return rec.Code, resp
+@@ -348,3 +372,54 @@ func TestWebhookIsSafeToRepeatAndNeverMovesBackwards(t *testing.T) {
+ 		t.Errorf("a cancelled shipment became %s", s)
+ 	}
+ }
++
++func TestWebhookOnlyAcceptsCallsSignedWithTheSharedSecret(t *testing.T) {
++	setupTestDB(t)
++	createFor(t, 42)
++	body := fmt.Sprintf(`{"tracking_number":%q,"status":"in_transit"}`, trackingOf(t, 42))
++	tampered := strings.Replace(body, "in_transit", "delivered", 1)
++
++	cases := []struct {
++		name, body, signature string
++	}{
++		{"no signature", body, ""},
++		{"signed with another secret", body, sign("not-the-secret", body)},
++		{"body changed after signing", tampered, sign(testWebhookSecret, body)},
++		{"signature without the sha256= prefix", body, strings.TrimPrefix(sign(testWebhookSecret, body), "sha256=")},
++		{"signature that is not hex", body, "sha256=zz"},
++	}
++	for _, c := range cases {
++		if code, _ := webhookWithSignature(t, c.body, c.signature); code != http.StatusUnauthorized {
++			t.Errorf("%s: got %d, want 401", c.name, code)
++		}
++	}
++	if s := statusOf(t, 42); s != "label_created" {
++		t.Fatalf("a rejected call moved the shipment to %s", s)
++	}
++	if code, _ := webhook(t, body); code != http.StatusOK {
++		t.Fatalf("correctly signed call: got %d, want 200", code)
++	}
++}
++
++func TestWebhookWithoutASecretRefusesEveryCall(t *testing.T) {
++	setupTestDB(t)
++	createFor(t, 42)
++	body := fmt.Sprintf(`{"tracking_number":%q,"status":"in_transit"}`, trackingOf(t, 42))
++	webhookSecret = nil
++	t.Cleanup(func() { webhookSecret = []byte(testWebhookSecret) })
++	rec := httptest.NewRecorder()
++	req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewBufferString(body))
++	req.Header.Set("X-Carrier-Signature", sign("", body))
++	handleCarrierWebhook(rec, req)
++	if rec.Code != http.StatusServiceUnavailable {
++		t.Fatalf("no secret configured: got %d, want 503", rec.Code)
++	}
++}
++
++func TestWebhookRefusesABodyOver64KB(t *testing.T) {
++	setupTestDB(t)
++	big := `{"tracking_number":"x","status":"delivered","description":"` + strings.Repeat("a", 70<<10) + `"}`
++	if code, _ := webhook(t, big); code != http.StatusBadRequest {
++		t.Fatalf("70 KB body: got %d, want 400", code)
++	}
++}
+diff --git a/services/worker/main.go b/services/worker/main.go
+index 7d13304..26ad3a8 100644
+--- a/services/worker/main.go
++++ b/services/worker/main.go
+@@ -399,11 +399,22 @@ func refundCharge(client *http.Client, services map[string]string, orderID int)
+ 
+ // orderInfo is the part of an order the worker needs for emails and shipments.
+ type orderInfo struct {
+-	ID         int     `json:"id"`
+-	CustomerID string  `json:"customer_id"`
+-	Status     string  `json:"status"`
+-	Total      float64 `json:"total"`
+-	Currency   string  `json:"currency"`
++	ID              int           `json:"id"`
++	CustomerID      string        `json:"customer_id"`
++	Status          string        `json:"status"`
++	Total           float64       `json:"total"`
++	Currency        string        `json:"currency"`
++	ShippingAddress *orderAddress `json:"shipping_address"`
++}
++
++// orderAddress is the address order-service stored with the order (checked there).
++type orderAddress struct {
++	Name     string `json:"name"`
++	Line1    string `json:"line1"`
++	Line2    string `json:"line2"`
++	City     string `json:"city"`
++	Postcode string `json:"postcode"`
++	Country  string `json:"country"`
+ }
+ 
+ // getOrder asks order-service for the order as it is now.
+@@ -430,25 +441,33 @@ func getOrderStatus(client *http.Client, services map[string]string, orderID int
+ 	return order.Status, err
+ }
+ 
+-// There is no address model yet (ALPHA-78), so every shipment gets this placeholder.
+-// The shipment, its tracking number and its status all work; only the address is empty.
+-const placeholderAddress = "PLACEHOLDER - no address collected yet (ALPHA-78)"
++// Orders placed before addresses existed have none, and their shipments get this
++// placeholder. The shipment, its tracking number and its status still work.
++const placeholderAddress = "PLACEHOLDER - no address on the order"
+ 
+ // createShipment makes the order's shipment. Safe to repeat: shipping-service keeps one
+ // shipment per order and answers 200 with the existing one.
+ func createShipment(client *http.Client, services map[string]string, o orderInfo) error {
+-	recipient := o.CustomerID
+-	if recipient == "" {
+-		recipient = "unknown customer"
+-	}
+-	code, err := sendJSON(client, http.MethodPost, services["shipping"]+"/shipments", map[string]interface{}{
+-		"order_id":       o.ID,
+-		"recipient_name": recipient,
+-		"address_line1":  placeholderAddress,
+-		"city":           "TBC",
+-		"postcode":       "TBC",
+-		"country":        "GB",
+-	})
++	shipment := map[string]interface{}{"order_id": o.ID}
++	if a := o.ShippingAddress; a != nil {
++		shipment["recipient_name"] = a.Name
++		shipment["address_line1"] = a.Line1
++		shipment["address_line2"] = a.Line2
++		shipment["city"] = a.City
++		shipment["postcode"] = a.Postcode
++		shipment["country"] = a.Country
++	} else {
++		recipient := o.CustomerID
++		if recipient == "" {
++			recipient = "unknown customer"
++		}
++		shipment["recipient_name"] = recipient
++		shipment["address_line1"] = placeholderAddress
++		shipment["city"] = "TBC"
++		shipment["postcode"] = "TBC"
++		shipment["country"] = "GB"
++	}
++	code, err := sendJSON(client, http.MethodPost, services["shipping"]+"/shipments", shipment)
+ 	if err != nil {
+ 		return fmt.Errorf("create shipment: %w", err)
+ 	}
+diff --git a/services/worker/main_test.go b/services/worker/main_test.go
+index 22a3107..2016b40 100644
+--- a/services/worker/main_test.go
++++ b/services/worker/main_test.go
+@@ -28,6 +28,7 @@ type fakeServices struct {
+ 	codes       map[string]int                    // path -> status code, default 200
+ 	seq         map[string][]int                  // path -> codes for the next calls, used before codes
+ 	orderStatus string                            // what GET /42 reports, default "pending"
++	address     map[string]interface{}            // shipping_address GET /42 reports, none by default
+ 	keys        map[string]string                 // call -> Idempotency-Key header it carried
+ }
+ 
+@@ -73,9 +74,13 @@ func newFakeServicesWithStatus(t *testing.T, codes map[string]int, orderStatus s
+ 		}
+ 		switch {
+ 		case r.Method == http.MethodGet:
+-			json.NewEncoder(w).Encode(map[string]interface{}{
++			order := map[string]interface{}{
+ 				"status": f.orderStatus, "customer_id": "sara@example.com", "total": 239.97, "currency": "GBP",
+-			})
++			}
++			if f.address != nil {
++				order["shipping_address"] = f.address
++			}
++			json.NewEncoder(w).Encode(order)
+ 		case strings.HasPrefix(r.URL.Path, "/shipments/by-order/"):
+ 			json.NewEncoder(w).Encode(map[string]interface{}{"tracking_number": "RM123"})
+ 		}
+@@ -500,6 +505,18 @@ func TestReserveAgainOutageKeepsMessageForRetry(t *testing.T) {
+ 	}
+ }
+ 
++func TestProcessingOrderShipsToTheOrdersAddress(t *testing.T) {
++	f, services := newFakeServicesWithStatus(t, map[string]int{"/shipments": 201}, "processing")
++	f.address = map[string]interface{}{"name": "Sam Shopper", "line1": "1 High St", "city": "Leeds", "postcode": "LS1 1AA", "country": "GB"}
++	if err := handleEvent(&http.Client{Timeout: 2 * time.Second}, services, statusChanged(t, "confirmed", "processing")); err != nil {
++		t.Fatalf("got error %v, want nil", err)
++	}
++	sent := f.bodies["POST /shipments"]
++	if sent["recipient_name"] != "Sam Shopper" || sent["address_line1"] != "1 High St" || sent["city"] != "Leeds" || sent["postcode"] != "LS1 1AA" {
++		t.Fatalf("shipment did not use the order's address: %v", sent)
++	}
++}
++
+ // Every retry of one order's charge must carry the same key, so payment can answer a
+ // retry with the first result (a decline included) instead of trying the card again.
+ func TestChargeCarriesTheSameKeyOnEveryRetry(t *testing.T) {

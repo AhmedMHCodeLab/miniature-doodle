@@ -1,0 +1,1690 @@
+diff --git a/services/api-gateway/allowlist.go b/services/api-gateway/allowlist.go
+new file mode 100644
+index 0000000..26f20f0
+--- /dev/null
++++ b/services/api-gateway/allowlist.go
+@@ -0,0 +1,99 @@
++package main
++
++// Which downstream routes the gateway exposes.
++//
++// Every /api/<service>/<path> used to be forwarded for any logged-in user, including the
++// routes that only other services should call: take payment, refund, reserve or restock
++// stock, create or move shipments, send notifications. The gateway now forwards only the
++// routes below. Everything else gets a 404 here and never reaches the service.
++//
++// Services still call each other directly on their cluster addresses (the worker does not
++// go through the gateway), so closing these routes at the edge does not affect the order
++// flow. If a new public endpoint is added to a service, add it here as well.
++
++import "strings"
++
++type routeRule struct {
++	method  string
++	pattern string // "/", "/products", "/products/*" (one segment), "/dashboard/**" (everything below)
++}
++
++// The path is what the service sees, i.e. with the /api/<service> prefix already removed.
++var exposedRoutes = map[string][]routeRule{
++	"/api/orders": {
++		{"GET", "/"}, {"POST", "/"}, {"GET", "/*"}, // list, create, read one
++		{"PUT", "/status"}, // the dashboard advances and cancels orders
++		{"GET", "/healthz"},
++	},
++	"/api/inventory": {
++		{"GET", "/products"}, {"POST", "/products"}, {"GET", "/products/*"}, {"GET", "/low-stock"},
++		{"GET", "/healthz"},
++	},
++	"/api/payments": {
++		{"GET", "/ledger"}, {"GET", "/balance/*"},
++		{"GET", "/healthz"},
++	},
++	"/api/notifications": {
++		{"GET", "/history"}, {"GET", "/templates"},
++		{"GET", "/healthz"},
++	},
++	"/api/shipping": {
++		{"GET", "/shipments"}, {"GET", "/shipments/*"}, {"GET", "/track/*"},
++		{"POST", "/webhook"}, // carrier callbacks (public, strictly rate limited)
++		{"GET", "/healthz"},
++	},
++	"/api/dashboard": {{"GET", "/**"}},
++	"/dashboard/":    {{"GET", "/**"}},
++}
++
++// isExposed reports whether a request may be forwarded. prefix is the matched route
++// ("/api/orders"), path is the path the service would receive.
++func isExposed(prefix, method, path string) bool {
++	rules, ok := exposedRoutes[prefix]
++	if !ok {
++		return false
++	}
++	if !strings.HasPrefix(path, "/") {
++		return false
++	}
++	segs := splitPath(path)
++	if segs == nil {
++		return false // empty segments or . / .. in the path: never forwarded
++	}
++	for _, rule := range rules {
++		if rule.method == method && matchPattern(splitPath(rule.pattern), segs) {
++			return true
++		}
++	}
++	return false
++}
++
++// splitPath returns the path's segments, [] for "/", or nil for an unsafe path.
++func splitPath(p string) []string {
++	if p == "/" {
++		return []string{}
++	}
++	trimmed := strings.TrimSuffix(strings.TrimPrefix(p, "/"), "/")
++	segs := strings.Split(trimmed, "/")
++	for _, s := range segs {
++		if s == "" || s == "." || s == ".." {
++			return nil
++		}
++	}
++	return segs
++}
++
++func matchPattern(pattern, segs []string) bool {
++	for i, p := range pattern {
++		if p == "**" {
++			return true
++		}
++		if i >= len(segs) {
++			return false
++		}
++		if p != "*" && p != segs[i] {
++			return false
++		}
++	}
++	return len(pattern) == len(segs)
++}
+diff --git a/services/api-gateway/allowlist_test.go b/services/api-gateway/allowlist_test.go
+new file mode 100644
+index 0000000..8bc6037
+--- /dev/null
++++ b/services/api-gateway/allowlist_test.go
+@@ -0,0 +1,165 @@
++package main
++
++import (
++	"net/http"
++	"net/http/httptest"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/golang-jwt/jwt/v5"
++)
++
++// allowlistSetup points every route at one fake upstream and counts how many requests reached it.
++func allowlistSetup(t *testing.T) *int64 {
++	t.Helper()
++	var hits int64
++	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		atomic.AddInt64(&hits, 1)
++		w.WriteHeader(http.StatusOK)
++	}))
++	t.Cleanup(upstream.Close)
++	jwtSecret = []byte("test-secret")
++	setLimits(t, 1000, 1000, 1000, "")
++	routes = map[string]string{
++		"/api/orders":        upstream.URL,
++		"/api/inventory":     upstream.URL,
++		"/api/payments":      upstream.URL,
++		"/api/notifications": upstream.URL,
++		"/api/shipping":      upstream.URL,
++		"/api/dashboard":     upstream.URL,
++		"/dashboard/":        upstream.URL,
++	}
++	return &hits
++}
++
++func gatewayRequest(method, path string, loggedIn bool) int {
++	req := httptest.NewRequest(method, path, nil)
++	req.RemoteAddr = "198.51.100.7:1234"
++	if loggedIn {
++		tok, _ := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
++			"sub": "admin@platform.local", "exp": time.Now().Add(time.Hour).Unix(),
++		}).SignedString(jwtSecret)
++		req.Header.Set("Authorization", "Bearer "+tok)
++	}
++	rec := httptest.NewRecorder()
++	handleProxy(rec, req)
++	return rec.Code
++}
++
++// Everything the dashboard page and the health grid call must still get through.
++func TestRoutesTheDashboardUsesAreForwarded(t *testing.T) {
++	hits := allowlistSetup(t)
++	calls := []struct{ method, path string }{
++		{"GET", "/api/orders/"}, {"POST", "/api/orders/"}, {"PUT", "/api/orders/status"}, {"GET", "/api/orders/42"},
++		{"GET", "/api/inventory/products"}, {"POST", "/api/inventory/products"}, {"GET", "/api/inventory/products/p1"},
++		{"GET", "/api/inventory/low-stock"},
++		{"GET", "/api/payments/ledger"}, {"GET", "/api/payments/balance/alice"},
++		{"GET", "/api/shipping/shipments"}, {"GET", "/api/shipping/shipments/7"}, {"GET", "/api/shipping/track/RM123"},
++		{"GET", "/api/notifications/history"}, {"GET", "/api/notifications/templates"},
++		{"GET", "/dashboard/summary"}, {"GET", "/dashboard/revenue"}, {"GET", "/dashboard/shipping/overview"},
++		{"GET", "/api/dashboard/dashboard/summary"},
++		{"GET", "/api/orders/healthz"}, {"GET", "/api/inventory/healthz"}, {"GET", "/api/payments/healthz"},
++		{"GET", "/api/notifications/healthz"}, {"GET", "/api/shipping/healthz"},
++	}
++	for _, c := range calls {
++		if code := gatewayRequest(c.method, c.path, true); code != http.StatusOK {
++			t.Errorf("%s %s: got %d, want 200", c.method, c.path, code)
++		}
++	}
++	if got := atomic.LoadInt64(hits); int(got) != len(calls) {
++		t.Errorf("upstream saw %d requests, want %d", got, len(calls))
++	}
++}
++
++// Routes meant for other services answer 404 at the gateway and never reach the service,
++// even for a logged-in user.
++func TestInternalRoutesAreNotForwarded(t *testing.T) {
++	hits := allowlistSetup(t)
++	blocked := []struct{ method, path string }{
++		{"POST", "/api/payments/charge"}, {"POST", "/api/payments/refund"},
++		{"POST", "/api/inventory/reserve"}, {"POST", "/api/inventory/release"},
++		{"POST", "/api/inventory/commit"}, {"POST", "/api/inventory/restock"},
++		{"PUT", "/api/inventory/products/p1"}, {"DELETE", "/api/inventory/products/p1"},
++		{"POST", "/api/notifications/send"},
++		{"POST", "/api/shipping/shipments"}, {"PUT", "/api/shipping/shipments/by-order/42"},
++		{"GET", "/api/shipping/shipments/by-order/42"},
++		{"DELETE", "/api/orders/42"}, {"PUT", "/api/orders/42"}, {"POST", "/api/orders/status"},
++		{"POST", "/api/dashboard/anything"}, {"POST", "/dashboard/summary"},
++		{"GET", "/api/payments/"}, {"GET", "/api/orders/42/events"},
++	}
++	for _, c := range blocked {
++		if code := gatewayRequest(c.method, c.path, true); code != http.StatusNotFound {
++			t.Errorf("%s %s: got %d, want 404", c.method, c.path, code)
++		}
++	}
++	if got := atomic.LoadInt64(hits); got != 0 {
++		t.Errorf("%d blocked requests reached a service", got)
++	}
++}
++
++// Odd spellings of an allowed route must not slip through to a blocked one.
++func TestPathTricksAreNotForwarded(t *testing.T) {
++	hits := allowlistSetup(t)
++	for _, path := range []string{
++		"/api/inventory/products/../restock",
++		"/api/inventory/products/./../reserve",
++		"/api/inventory//restock",
++		"/api/inventoryrestock",
++		"/api/ordersX/status",
++		"/api/orders/42/extra",
++		"/api/shipping/shipments/by-order/42/",
++	} {
++		if code := gatewayRequest("POST", path, true); code == http.StatusOK {
++			t.Errorf("POST %s was forwarded", path)
++		}
++		if code := gatewayRequest("PUT", path, true); code == http.StatusOK {
++			t.Errorf("PUT %s was forwarded", path)
++		}
++	}
++	// "*" matches one real segment, never "." or "..", which a service could resolve to its parent.
++	for _, path := range []string{"/api/inventory/products/..", "/api/orders/.", "/api/shipping/shipments/.."} {
++		if code := gatewayRequest("GET", path, true); code == http.StatusOK {
++			t.Errorf("GET %s was forwarded", path)
++		}
++	}
++	if got := atomic.LoadInt64(hits); got != 0 {
++		t.Errorf("%d tricky requests reached a service", got)
++	}
++}
++
++// The carrier webhook is public and must keep working without a token; the route next to it must not.
++func TestWebhookStaysOpenButNothingElseUnderShipping(t *testing.T) {
++	allowlistSetup(t)
++	if code := gatewayRequest("POST", "/api/shipping/webhook", false); code != http.StatusOK {
++		t.Errorf("webhook without token: got %d, want 200", code)
++	}
++	if code := gatewayRequest("GET", "/api/shipping/webhook", false); code != http.StatusNotFound {
++		t.Errorf("GET webhook: got %d, want 404", code)
++	}
++	if code := gatewayRequest("POST", "/api/shipping/shipments", false); code != http.StatusUnauthorized {
++		t.Errorf("creating a shipment without a token: got %d, want 401", code)
++	}
++}
++
++func TestIsExposedMatching(t *testing.T) {
++	cases := []struct {
++		prefix, method, path string
++		want                 bool
++	}{
++		{"/api/orders", "GET", "/", true},
++		{"/api/orders", "GET", "/42", true},
++		{"/api/orders", "GET", "/42/x", false},
++		{"/api/orders", "PUT", "/status", true},
++		{"/api/orders", "PUT", "/42", false},
++		{"/api/payments", "POST", "/charge", false},
++		{"/api/unknown", "GET", "/", false},
++		{"/dashboard/", "GET", "/dashboard/summary", true},
++		{"/api/orders", "GET", "status", false},
++	}
++	for _, c := range cases {
++		if got := isExposed(c.prefix, c.method, c.path); got != c.want {
++			t.Errorf("isExposed(%s, %s, %s) = %v, want %v", c.prefix, c.method, c.path, got, c.want)
++		}
++	}
++}
+diff --git a/services/api-gateway/main.go b/services/api-gateway/main.go
+index f3c1e4a..b302e34 100644
+--- a/services/api-gateway/main.go
++++ b/services/api-gateway/main.go
+@@ -237,7 +237,8 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
+ 
+ 	// Find matching route
+ 	for prefix, targetURL := range routes {
+-		if strings.HasPrefix(r.URL.Path, prefix) {
++		// Match whole path segments: /api/orders and /api/orders/..., not /api/ordersX.
++		if r.URL.Path == prefix || strings.HasPrefix(r.URL.Path, strings.TrimSuffix(prefix, "/")+"/") {
+ 			// Strip the route prefix for downstream. dashboard-api serves /dashboard/*
+ 			// under that exact path, so that route keeps it.
+ 			if prefix != "/dashboard/" {
+@@ -246,6 +247,11 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
+ 					r.URL.Path = "/"
+ 				}
+ 			}
++			// Only routes meant for the outside world are forwarded (see allowlist.go).
++			if !isExposed(prefix, r.Method, r.URL.Path) {
++				httpError(w, "not found", http.StatusNotFound)
++				return
++			}
+ 			forward(w, r, targetURL)
+ 			return
+ 		}
+diff --git a/services/dashboard-api/static/index.html b/services/dashboard-api/static/index.html
+index cf329ac..b43f3bb 100644
+--- a/services/dashboard-api/static/index.html
++++ b/services/dashboard-api/static/index.html
+@@ -217,8 +217,16 @@
+             refreshAll();
+         }
+ 
++        // Everything that comes back from the API is written into the page with innerHTML,
++        // and some of it (the customer email, product ids, notes) is typed by whoever logged in.
++        // esc() turns it into plain text first, so "<img onerror=...>" shows up as text
++        // instead of running as code in the admin's browser.
++        function esc(v) {
++            return String(v ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
++        }
++
+         function badge(status) {
+-            return `<span class="badge badge-${status}">${status}</span>`;
++            return `<span class="badge badge-${esc(status)}">${esc(status)}</span>`;
+         }
+ 
+         function ts(s) {
+@@ -234,11 +242,11 @@
+                 const r = await fetch(API + '/dashboard/summary', { headers: headers() });
+                 const d = await r.json();
+                 document.getElementById('stats').innerHTML = `
+-                    <div class="card"><div class="card-label">Total Orders</div><div class="card-value blue">${d.orders?.total || 0}</div></div>
+-                    <div class="card"><div class="card-label">Today's Orders</div><div class="card-value green">${d.orders?.today || 0}</div></div>
++                    <div class="card"><div class="card-label">Total Orders</div><div class="card-value blue">${esc(d.orders?.total || 0)}</div></div>
++                    <div class="card"><div class="card-label">Today's Orders</div><div class="card-value green">${esc(d.orders?.today || 0)}</div></div>
+                     <div class="card"><div class="card-label">Revenue</div><div class="card-value green">${money(d.revenue?.total)}</div></div>
+-                    <div class="card"><div class="card-label">Low Stock Alerts</div><div class="card-value ${d.inventory?.low_stock > 0 ? 'red' : 'green'}">${d.inventory?.low_stock || 0}</div></div>
+-                    <div class="card"><div class="card-label">Active Shipments</div><div class="card-value orange">${d.shipping?.active_shipments || 0}</div></div>
++                    <div class="card"><div class="card-label">Low Stock Alerts</div><div class="card-value ${d.inventory?.low_stock > 0 ? 'red' : 'green'}">${esc(d.inventory?.low_stock || 0)}</div></div>
++                    <div class="card"><div class="card-label">Active Shipments</div><div class="card-value orange">${esc(d.shipping?.active_shipments || 0)}</div></div>
+                 `;
+             } catch(e) { console.error('Stats error', e); }
+         }
+@@ -252,16 +260,18 @@
+                 if (!orders || !orders.length) { tbody.innerHTML = '<tr><td colspan="7" style="color:#8b949e">No orders yet</td></tr>'; return; }
+                 tbody.innerHTML = orders.map(o => {
+                     const items = (typeof o.items === 'string' ? JSON.parse(o.items) : o.items) || [];
+-                    const itemStr = items.map(i => `${i.product_id} x${i.quantity}`).join(', ');
++                    const itemStr = items.map(i => `${esc(i.product_id)} x${esc(i.quantity)}`).join(', ');
+                     let actions = '';
+-                    const next = { pending: 'confirmed', confirmed: 'processing', processing: 'shipped', shipped: 'delivered' };
++                    // No pending -> confirmed button: the worker confirms an order itself, after the payment
++                    // has gone through. A manual confirm here would skip the payment.
++                    const next = { confirmed: 'processing', processing: 'shipped', shipped: 'delivered' };
+                     if (next[o.status]) {
+-                        actions = `<button class="btn btn-sm btn-blue" onclick="advanceOrder(${o.id},'${next[o.status]}')">${next[o.status]}</button>`;
++                        actions = `<button class="btn btn-sm btn-blue" onclick="advanceOrder(${Number(o.id)},'${next[o.status]}')">${next[o.status]}</button>`;
+                     }
+                     if (['pending','confirmed','processing'].includes(o.status)) {
+-                        actions += ` <button class="btn btn-sm btn-orange" onclick="advanceOrder(${o.id},'cancelled')">cancel</button>`;
++                        actions += ` <button class="btn btn-sm btn-orange" onclick="advanceOrder(${Number(o.id)},'cancelled')">cancel</button>`;
+                     }
+-                    return `<tr><td>${o.id}</td><td>${o.customer_id}</td><td>${itemStr}</td><td>${money(o.total)}</td><td>${badge(o.status)}</td><td>${ts(o.created_at)}</td><td>${actions}</td></tr>`;
++                    return `<tr><td>${esc(o.id)}</td><td>${esc(o.customer_id)}</td><td>${itemStr}</td><td>${money(o.total)}</td><td>${badge(o.status)}</td><td>${ts(o.created_at)}</td><td>${actions}</td></tr>`;
+                 }).join('');
+             } catch(e) { console.error('Orders error', e); }
+         }
+@@ -325,7 +335,7 @@
+                 tbody.innerHTML = products.map(p => {
+                     const avail = p.available ?? (p.stock - p.reserved);
+                     const color = avail < 10 ? 'color:#f85149' : '';
+-                    return `<tr><td>${p.id}</td><td>${p.name}</td><td>${p.sku}</td><td>${money(p.price)}</td><td>${p.stock}</td><td>${p.reserved}</td><td style="${color}">${avail}</td></tr>`;
++                    return `<tr><td>${esc(p.id)}</td><td>${esc(p.name)}</td><td>${esc(p.sku)}</td><td>${money(p.price)}</td><td>${esc(p.stock)}</td><td>${esc(p.reserved)}</td><td style="${color}">${esc(avail)}</td></tr>`;
+                 }).join('');
+             } catch(e) { console.error('Inventory error', e); }
+         }
+@@ -369,7 +379,7 @@
+                 const tbody = document.getElementById('ledger-table');
+                 if (!entries || !entries.length) { tbody.innerHTML = '<tr><td colspan="6" style="color:#8b949e">No entries</td></tr>'; return; }
+                 tbody.innerHTML = entries.map(e => 
+-                    `<tr><td style="font-size:0.75rem">${e.payment_id}</td><td>${badge(e.entry_type)}</td><td>${e.debit > 0 ? money(e.debit) : '-'}</td><td>${e.credit > 0 ? money(e.credit) : '-'}</td><td>${e.description}</td><td>${ts(e.created_at)}</td></tr>`
++                    `<tr><td style="font-size:0.75rem">${esc(e.payment_id)}</td><td>${badge(e.entry_type)}</td><td>${e.debit > 0 ? money(e.debit) : '-'}</td><td>${e.credit > 0 ? money(e.credit) : '-'}</td><td>${esc(e.description)}</td><td>${ts(e.created_at)}</td></tr>`
+                 ).join('');
+             } catch(e) {}
+         }
+@@ -382,18 +392,18 @@
+                 const tbody = document.getElementById('shipping-table');
+                 if (!shipments || !shipments.length) { tbody.innerHTML = '<tr><td colspan="6" style="color:#8b949e">No shipments</td></tr>'; return; }
+                 tbody.innerHTML = shipments.map(s =>
+-                    `<tr><td>${s.id}</td><td>${s.order_id}</td><td>${s.carrier}</td><td>${s.tracking_number || '-'}</td><td>${badge(s.status)}</td><td>${s.recipient_name}</td></tr>`
++                    `<tr><td>${esc(s.id)}</td><td>${esc(s.order_id)}</td><td>${esc(s.carrier)}</td><td>${esc(s.tracking_number || '-')}</td><td>${badge(s.status)}</td><td>${esc(s.recipient_name)}</td></tr>`
+                 ).join('');
+             } catch(e) {}
+ 
+             try {
+                 const r = await fetch(API + '/dashboard/shipping/overview', { headers: headers() });
+                 const d = await r.json();
+-                const statuses = Object.entries(d.by_status || {}).map(([k,v]) => `${badge(k)} ${v}`).join('&nbsp;&nbsp;');
+-                const carriers = Object.entries(d.by_carrier || {}).map(([k,v]) => `${k}: ${v}`).join(', ');
++                const statuses = Object.entries(d.by_status || {}).map(([k,v]) => `${badge(k)} ${esc(v)}`).join('&nbsp;&nbsp;');
++                const carriers = Object.entries(d.by_carrier || {}).map(([k,v]) => `${esc(k)}: ${esc(v)}`).join(', ');
+                 document.getElementById('shipping-overview').innerHTML = `
+                     <p style="margin-bottom:8px">${statuses || 'No shipments'}</p>
+-                    <p style="color:#8b949e;font-size:0.85rem">Carriers: ${carriers || '-'} | Avg delivery: ${(d.avg_delivery_hours || 0).toFixed(1)}h</p>
++                    <p style="color:#8b949e;font-size:0.85rem">Carriers: ${carriers || '-'} | Avg delivery: ${(Number(d.avg_delivery_hours) || 0).toFixed(1)}h</p>
+                 `;
+             } catch(e) {}
+         }
+@@ -406,7 +416,7 @@
+                 const tbody = document.getElementById('notif-table');
+                 if (!notifs || !notifs.length) { tbody.innerHTML = '<tr><td colspan="6" style="color:#8b949e">No notifications</td></tr>'; return; }
+                 tbody.innerHTML = notifs.map(n =>
+-                    `<tr><td>${n.id}</td><td>${n.recipient}</td><td>${n.channel}</td><td>${n.template}</td><td>${badge(n.status)}</td><td>${ts(n.sent_at || n.created_at)}</td></tr>`
++                    `<tr><td>${esc(n.id)}</td><td>${esc(n.recipient)}</td><td>${esc(n.channel)}</td><td>${esc(n.template)}</td><td>${badge(n.status)}</td><td>${ts(n.sent_at || n.created_at)}</td></tr>`
+                 ).join('');
+             } catch(e) {}
+         }
+diff --git a/services/inventory-service/main.go b/services/inventory-service/main.go
+index 76bdd6b..eb34ee7 100644
+--- a/services/inventory-service/main.go
++++ b/services/inventory-service/main.go
+@@ -280,6 +280,9 @@ func handleProduct(w http.ResponseWriter, r *http.Request) {
+ 	json.NewEncoder(w).Encode(p)
+ }
+ 
++// reservationMinutes is how long an order's stock is held while it waits to be paid.
++const reservationMinutes = 15
++
+ func handleReserve(w http.ResponseWriter, r *http.Request) {
+ 	if r.Method != http.MethodPost {
+ 		httpError(w, "method not allowed", http.StatusMethodNotAllowed)
+@@ -315,7 +318,11 @@ func handleReserve(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 	defer tx.Rollback()
+ 
+-	expiresAt := time.Now().Add(15 * time.Minute)
++	// When the hold ends is worked out by the database clock, the same one the scheduler
++	// compares it with (expires_at < NOW()). A Go time here would be written as this
++	// process's wall-clock reading, so a process in another time zone than the database
++	// would make holds expire at once, or hours late.
++	var expiresAt time.Time
+ 
+ 	for _, item := range req.Items {
+ 		// Check available stock with row lock
+@@ -343,10 +350,12 @@ func handleReserve(w http.ResponseWriter, r *http.Request) {
+ 			return
+ 		}
+ 
+-		if _, err := tx.Exec(
+-			"INSERT INTO reservations (order_id, product_id, quantity, status, expires_at) VALUES ($1, $2, $3, 'active', $4)",
+-			req.OrderID, item.ProductID, item.Quantity, expiresAt,
+-		); err != nil {
++		var itemExpiry time.Time
++		if err := tx.QueryRow(
++			`INSERT INTO reservations (order_id, product_id, quantity, status, expires_at)
++			 VALUES ($1, $2, $3, 'active', NOW() + make_interval(mins => $4)) RETURNING expires_at`,
++			req.OrderID, item.ProductID, item.Quantity, reservationMinutes,
++		).Scan(&itemExpiry); err != nil {
+ 			if isUniqueViolation(err) {
+ 				// A concurrent request for the same order reserved first. Undo ours
+ 				// (including the reserved increment) and report theirs.
+@@ -359,6 +368,9 @@ func handleReserve(w http.ResponseWriter, r *http.Request) {
+ 			httpError(w, "reservation insert failed", http.StatusInternalServerError)
+ 			return
+ 		}
++		if expiresAt.IsZero() {
++			expiresAt = itemExpiry
++		}
+ 	}
+ 
+ 	if err := tx.Commit(); err != nil {
+@@ -472,7 +484,8 @@ func handleRelease(w http.ResponseWriter, r *http.Request) {
+ 
+ // handleCommit turns an order's held stock into a sale: stock and reserved both drop by
+ // the quantity and the reservation becomes 'committed', which the scheduler never
+-// expires. Same claim-then-act pattern as release, so a repeat commits nothing.
++// expires. Same claim-then-act pattern as release, so a repeat commits nothing. An order
++// with no active hold and nothing committed answers 409.
+ func handleCommit(w http.ResponseWriter, r *http.Request) {
+ 	if r.Method != http.MethodPost {
+ 		httpError(w, "method not allowed", http.StatusMethodNotAllowed)
+@@ -522,6 +535,24 @@ func handleCommit(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
++	if len(items) == 0 {
++		// Nothing active was claimed. A repeat of a commit that already happened is fine (200,
++		// committed 0). But an order whose hold expired, was released or never existed has
++		// not been sold anything: say so (409) instead of reporting a sale that never took
++		// the stock off the shelf. The worker then re-reserves, or cancels and refunds.
++		var committed int
++		if err := tx.QueryRow(
++			"SELECT COUNT(*) FROM reservations WHERE order_id = $1 AND status = 'committed'", req.OrderID,
++		).Scan(&committed); err != nil {
++			httpError(w, "commit failed", http.StatusInternalServerError)
++			return
++		}
++		if committed == 0 {
++			httpError(w, "no active reservation to commit (the hold expired, was released, or was never made)", http.StatusConflict)
++			return
++		}
++	}
++
+ 	for _, it := range items {
+ 		if _, err := tx.Exec(
+ 			"UPDATE products SET stock = stock - $1, reserved = reserved - $1, updated_at = NOW() WHERE id = $2",
+diff --git a/services/inventory-service/main_test.go b/services/inventory-service/main_test.go
+index 704561a..0040fe4 100644
+--- a/services/inventory-service/main_test.go
++++ b/services/inventory-service/main_test.go
+@@ -17,6 +17,7 @@ import (
+ 	"os"
+ 	"sync"
+ 	"testing"
++	"time"
+ )
+ 
+ func setupTestDB(t *testing.T) {
+@@ -262,3 +263,95 @@ func TestReserveAfterCommitHoldsNothingMore(t *testing.T) {
+ 		t.Errorf("stock=%d reserved=%d, want stock=3 reserved=0", stock, reserved)
+ 	}
+ }
++
++// A hold lasts 15 minutes by the DATABASE's clock, whatever time zone the service runs in.
++// Before, the Go clock's wall-clock reading was stored, so a service in UTC-8 wrote holds that
++// were already 8 hours expired and the scheduler gave the stock straight back.
++func TestHoldLengthDoesNotDependOnTheServiceTimeZone(t *testing.T) {
++	setupTestDB(t)
++	old := time.Local
++	t.Cleanup(func() { time.Local = old })
++
++	for _, zone := range []*time.Location{time.FixedZone("LA", -8*3600), time.FixedZone("AKL", 13*3600), time.UTC} {
++		time.Local = zone
++		if _, err := db.Exec(`TRUNCATE reservations RESTART IDENTITY`); err != nil {
++			t.Fatal(err)
++		}
++		db.Exec(`UPDATE products SET reserved = 0`)
++		if rec := post(t, handleReserve, reserveBody(1, 1)); rec.Code != http.StatusCreated {
++			t.Fatalf("%s: reserve got %d", zone, rec.Code)
++		}
++		var minutes float64
++		if err := db.QueryRow(`SELECT EXTRACT(EPOCH FROM (expires_at - NOW())) / 60 FROM reservations WHERE order_id = 1`).Scan(&minutes); err != nil {
++			t.Fatal(err)
++		}
++		if minutes < 14 || minutes > 15.1 {
++			t.Errorf("service in %s: hold has %.1f minutes left, want about 15", zone, minutes)
++		}
++	}
++}
++
++// The hold timed out (the scheduler expired it) before the order was committed. Saying
++// "committed" would let a paid order finish without the stock leaving the shelf.
++func TestCommitOfAnExpiredHoldIsRefused(t *testing.T) {
++	setupTestDB(t)
++	post(t, handleReserve, reserveBody(1, 2))
++	db.Exec(`UPDATE reservations SET status = 'expired' WHERE order_id = 1`)
++	db.Exec(`UPDATE products SET reserved = 0`)
++
++	rec := post(t, handleCommit, map[string]int{"order_id": 1})
++	if rec.Code != http.StatusConflict {
++		t.Fatalf("commit of expired hold: got %d, want 409", rec.Code)
++	}
++	if stock := stockCount(t); stock != 5 {
++		t.Errorf("stock = %d, want 5 (nothing sold)", stock)
++	}
++}
++
++func TestCommitOfAnOrderWithNoHoldIsRefused(t *testing.T) {
++	setupTestDB(t)
++	if rec := post(t, handleCommit, map[string]int{"order_id": 99}); rec.Code != http.StatusConflict {
++		t.Fatalf("commit with no hold: got %d, want 409", rec.Code)
++	}
++}
++
++// A hold that was released (the order was cancelled) is not a sale either.
++func TestCommitOfAReleasedHoldIsRefused(t *testing.T) {
++	setupTestDB(t)
++	post(t, handleReserve, reserveBody(1, 2))
++	post(t, handleRelease, map[string]int{"order_id": 1})
++	if rec := post(t, handleCommit, map[string]int{"order_id": 1}); rec.Code != http.StatusConflict {
++		t.Fatalf("commit after release: got %d, want 409", rec.Code)
++	}
++	if stock := stockCount(t); stock != 5 {
++		t.Errorf("stock = %d, want 5", stock)
++	}
++}
++
++// Many commits at once for one order: one takes the stock, the others are repeats (200),
++// never a 409 for an order that really was committed.
++func TestConcurrentCommitsAreAllSuccessfulRepeats(t *testing.T) {
++	setupTestDB(t)
++	post(t, handleReserve, reserveBody(1, 2))
++	codes := make([]int, 20)
++	start := make(chan struct{})
++	var wg sync.WaitGroup
++	for i := range codes {
++		wg.Add(1)
++		go func(i int) {
++			defer wg.Done()
++			<-start
++			codes[i] = post(t, handleCommit, map[string]int{"order_id": 1}).Code
++		}(i)
++	}
++	close(start)
++	wg.Wait()
++	for i, c := range codes {
++		if c != http.StatusOK {
++			t.Fatalf("commit %d got %d, want 200", i, c)
++		}
++	}
++	if stock := stockCount(t); stock != 3 {
++		t.Errorf("stock = %d, want 3", stock)
++	}
++}
+diff --git a/services/notification-service/main.go b/services/notification-service/main.go
+index d6f9630..075c9f0 100644
+--- a/services/notification-service/main.go
++++ b/services/notification-service/main.go
+@@ -114,6 +114,7 @@ func migrate() {
+ 		{"order_confirmed", "email", "Order Confirmed - #{{.OrderID}}", "Hi {{.CustomerName}}, your order #{{.OrderID}} has been confirmed. Total: {{.Currency}} {{.Total}}"},
+ 		{"order_shipped", "email", "Your Order Has Shipped - #{{.OrderID}}", "Good news! Your order #{{.OrderID}} has been shipped. Tracking: {{.TrackingNumber}}"},
+ 		{"order_delivered", "email", "Order Delivered - #{{.OrderID}}", "Your order #{{.OrderID}} has been delivered. Thank you for your purchase!"},
++		{"order_cancelled", "email", "Order Cancelled - #{{.OrderID}}", "Hi {{.CustomerName}}, your order #{{.OrderID}} has been cancelled. If you were charged, {{.Currency}} {{.Total}} is being refunded to your card."},
+ 		{"payment_failed", "email", "Payment Failed - Order #{{.OrderID}}", "We were unable to process your payment for order #{{.OrderID}}. Please update your payment method."},
+ 		{"low_stock_alert", "email", "Low Stock Alert - {{.ProductName}}", "Product {{.ProductName}} ({{.SKU}}) is running low. Available: {{.Available}}"},
+ 		{"order_confirmed_sms", "sms", "", "Order #{{.OrderID}} confirmed. Total: {{.Currency}} {{.Total}}"},
+diff --git a/services/notification-service/main_test.go b/services/notification-service/main_test.go
+index 31e5481..e38c996 100644
+--- a/services/notification-service/main_test.go
++++ b/services/notification-service/main_test.go
+@@ -15,6 +15,7 @@ import (
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"os"
++	"strings"
+ 	"sync"
+ 	"testing"
+ )
+@@ -179,3 +180,27 @@ func TestSendNeedsRecipientAndTemplate(t *testing.T) {
+ 		t.Errorf("got %d, want 400", code)
+ 	}
+ }
++
++// The cancellation email has a template, and it fills in the order's details.
++func TestOrderCancelledTemplateIsSeededAndRenders(t *testing.T) {
++	setupTestDB(t)
++	// Start from a database that has never seen the template, as a fresh one would.
++	if _, err := db.Exec(`DELETE FROM notification_templates WHERE id = 'order_cancelled'`); err != nil {
++		t.Fatal(err)
++	}
++	migrate()
++	code, _ := send(t, map[string]interface{}{
++		"recipient": "sara@example.com", "template": "order_cancelled", "dedupe_key": "order_cancelled:42",
++		"data": map[string]interface{}{"OrderID": 42, "CustomerName": "sara", "Currency": "GBP", "Total": "20.00"},
++	})
++	if code != http.StatusCreated {
++		t.Fatalf("got %d, want 201", code)
++	}
++	var subject, body string
++	if err := db.QueryRow(`SELECT subject, body FROM notifications WHERE template = 'order_cancelled'`).Scan(&subject, &body); err != nil {
++		t.Fatalf("read back: %v", err)
++	}
++	if subject != "Order Cancelled - #42" || !strings.Contains(body, "GBP 20.00") || !strings.Contains(body, "sara") {
++		t.Errorf("rendered %q / %q", subject, body)
++	}
++}
+diff --git a/services/scheduler/housekeeping_test.go b/services/scheduler/housekeeping_test.go
+new file mode 100644
+index 0000000..67844e2
+--- /dev/null
++++ b/services/scheduler/housekeeping_test.go
+@@ -0,0 +1,330 @@
++package main
++
++// Tests for the scheduler's jobs that work on other services' tables: giving back expired
++// stock holds, and pruning old rows. Each table is created with the same definition its
++// owning service uses, so these tests also run on a database those services' own tests used.
++
++import (
++	"sync"
++	"testing"
++)
++
++func setupHousekeepingDB(t *testing.T) {
++	t.Helper()
++	setupTestDB(t) // connects, creates and empties orders
++	ddl := []string{
++		`CREATE TABLE IF NOT EXISTS products (
++			id VARCHAR(50) PRIMARY KEY,
++			name VARCHAR(255) NOT NULL,
++			sku VARCHAR(100) UNIQUE NOT NULL,
++			price DECIMAL(10,2) NOT NULL,
++			stock INTEGER NOT NULL DEFAULT 0,
++			reserved INTEGER NOT NULL DEFAULT 0,
++			created_at TIMESTAMP DEFAULT NOW(),
++			updated_at TIMESTAMP DEFAULT NOW()
++		)`,
++		`CREATE TABLE IF NOT EXISTS reservations (
++			id SERIAL PRIMARY KEY,
++			order_id INTEGER NOT NULL,
++			product_id VARCHAR(50) NOT NULL REFERENCES products(id),
++			quantity INTEGER NOT NULL,
++			status VARCHAR(20) NOT NULL DEFAULT 'active',
++			expires_at TIMESTAMP NOT NULL,
++			created_at TIMESTAMP DEFAULT NOW()
++		)`,
++		`CREATE UNIQUE INDEX IF NOT EXISTS uq_reservations_active_order_product
++			ON reservations(order_id, product_id) WHERE status = 'active'`,
++		`CREATE TABLE IF NOT EXISTS order_events (
++			id SERIAL PRIMARY KEY,
++			order_id INTEGER NOT NULL REFERENCES orders(id),
++			event_type VARCHAR(50) NOT NULL,
++			old_status VARCHAR(20),
++			new_status VARCHAR(20),
++			metadata JSONB,
++			created_at TIMESTAMP DEFAULT NOW()
++		)`,
++		`CREATE TABLE IF NOT EXISTS order_outbox (
++			id BIGSERIAL PRIMARY KEY,
++			event_type VARCHAR(100) NOT NULL,
++			payload JSONB NOT NULL,
++			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
++			sent_at TIMESTAMPTZ,
++			attempts INTEGER NOT NULL DEFAULT 0,
++			last_error TEXT
++		)`,
++		`CREATE TABLE IF NOT EXISTS idempotency_keys (
++			customer_id VARCHAR(255) NOT NULL,
++			key VARCHAR(255) NOT NULL,
++			request_hash CHAR(64) NOT NULL,
++			order_id INTEGER REFERENCES orders(id),
++			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
++			PRIMARY KEY (customer_id, key)
++		)`,
++		`CREATE TABLE IF NOT EXISTS notifications (
++			id SERIAL PRIMARY KEY,
++			recipient VARCHAR(255) NOT NULL,
++			channel VARCHAR(20) NOT NULL,
++			template VARCHAR(100) NOT NULL,
++			subject TEXT,
++			body TEXT NOT NULL,
++			metadata JSONB,
++			status VARCHAR(20) NOT NULL DEFAULT 'pending',
++			sent_at TIMESTAMP,
++			created_at TIMESTAMP DEFAULT NOW()
++		)`,
++	}
++	for _, q := range ddl {
++		if _, err := db.Exec(q); err != nil {
++			t.Fatalf("create table: %v\n%s", err, q)
++		}
++	}
++	if _, err := db.Exec(`TRUNCATE order_outbox, notifications, reservations, products RESTART IDENTITY CASCADE`); err != nil {
++		t.Fatalf("truncate: %v", err)
++	}
++}
++
++func countRows(t *testing.T, query string, args ...interface{}) int {
++	t.Helper()
++	var n int
++	if err := db.QueryRow(query, args...).Scan(&n); err != nil {
++		t.Fatalf("count %q: %v", query, err)
++	}
++	return n
++}
++
++// addProduct creates a product with the given stock and reserved counts.
++func addProduct(t *testing.T, id string, stock, reserved int) {
++	t.Helper()
++	if _, err := db.Exec(`INSERT INTO products (id, name, sku, price, stock, reserved) VALUES ($1, $1, $1, 5, $2, $3)`, id, stock, reserved); err != nil {
++		t.Fatalf("add product: %v", err)
++	}
++}
++
++// addReservation holds qty of a product for an order; minutesLeft < 0 means already expired.
++func addReservation(t *testing.T, orderID int, product string, qty, minutesLeft int) int {
++	t.Helper()
++	var id int
++	err := db.QueryRow(
++		`INSERT INTO reservations (order_id, product_id, quantity, status, expires_at)
++		 VALUES ($1, $2, $3, 'active', NOW() + make_interval(mins => $4)) RETURNING id`,
++		orderID, product, qty, minutesLeft,
++	).Scan(&id)
++	if err != nil {
++		t.Fatalf("add reservation: %v", err)
++	}
++	return id
++}
++
++func productCounts(t *testing.T, id string) (stock, reserved int) {
++	t.Helper()
++	if err := db.QueryRow(`SELECT stock, reserved FROM products WHERE id = $1`, id).Scan(&stock, &reserved); err != nil {
++		t.Fatalf("product counts: %v", err)
++	}
++	return
++}
++
++func reservationStatus(t *testing.T, id int) string {
++	t.Helper()
++	var s string
++	if err := db.QueryRow(`SELECT status FROM reservations WHERE id = $1`, id).Scan(&s); err != nil {
++		t.Fatalf("reservation status: %v", err)
++	}
++	return s
++}
++
++func TestExpiredHoldGivesStockBackOnce(t *testing.T) {
++	setupHousekeepingDB(t)
++	addProduct(t, "p1", 20, 8)
++	old := addReservation(t, 1, "p1", 3, -5)
++	live := addReservation(t, 2, "p1", 5, 10)
++
++	expireReservations()
++	expireReservations() // a second run must not give it back again
++
++	if s := reservationStatus(t, old); s != "expired" {
++		t.Errorf("old hold: %s, want expired", s)
++	}
++	if s := reservationStatus(t, live); s != "active" {
++		t.Errorf("live hold: %s, want active", s)
++	}
++	if _, reserved := productCounts(t, "p1"); reserved != 5 {
++		t.Errorf("reserved: got %d, want 5 (8 minus the expired 3)", reserved)
++	}
++}
++
++// The order was paid (committed) in the instant the scheduler had already picked its hold
++// as expired. The commit already took the stock off; the scheduler must not give it back.
++func TestHoldCommittedJustBeforeExpiryIsLeftAlone(t *testing.T) {
++	setupHousekeepingDB(t)
++	addProduct(t, "p1", 20, 10)
++	id := addReservation(t, 1, "p1", 3, -1)
++	// what inventory-service's /commit does:
++	if _, err := db.Exec(`UPDATE reservations SET status = 'committed' WHERE id = $1`, id); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := db.Exec(`UPDATE products SET stock = stock - 3, reserved = reserved - 3 WHERE id = 'p1'`); err != nil {
++		t.Fatal(err)
++	}
++
++	expired, err := expireReservation(id) // the scheduler acting on the id it had already read
++	if err != nil || expired {
++		t.Fatalf("expireReservation = %v, %v; want false, nil", expired, err)
++	}
++	stock, reserved := productCounts(t, "p1")
++	if stock != 17 || reserved != 7 {
++		t.Errorf("stock %d reserved %d, want 17 and 7", stock, reserved)
++	}
++	if s := reservationStatus(t, id); s != "committed" {
++		t.Errorf("status %s, want committed", s)
++	}
++}
++
++// Commit and expiry at the same moment, many times. Whichever wins, the numbers must add up:
++// committed -> stock down 3 and reserved down 3; expired -> stock unchanged, reserved down 3.
++// Giving the stock back on top of a commit would show as reserved down 6.
++func TestCommitAndExpiryRacingNeverGiveStockBackTwice(t *testing.T) {
++	setupHousekeepingDB(t)
++	db.SetMaxOpenConns(6)
++	db.SetMaxIdleConns(6)
++	var warm sync.WaitGroup
++	for i := 0; i < 6; i++ {
++		warm.Add(1)
++		go func() { defer warm.Done(); db.Exec(`SELECT pg_sleep(0.05)`) }()
++	}
++	warm.Wait()
++
++	for run := 0; run < 40; run++ {
++		db.Exec(`TRUNCATE reservations, products RESTART IDENTITY CASCADE`)
++		addProduct(t, "p1", 20, 10)
++		id := addReservation(t, 1, "p1", 3, -1)
++
++		start := make(chan struct{})
++		var wg sync.WaitGroup
++		wg.Add(2)
++		go func() {
++			defer wg.Done()
++			<-start
++			expireReservation(id)
++		}()
++		go func() {
++			defer wg.Done()
++			<-start
++			commitLikeInventory(1)
++		}()
++		close(start)
++		wg.Wait()
++
++		stock, reserved := productCounts(t, "p1")
++		switch s := reservationStatus(t, id); s {
++		case "committed":
++			if stock != 17 || reserved != 7 {
++				t.Fatalf("run %d: committed but stock %d reserved %d, want 17 and 7", run, stock, reserved)
++			}
++		case "expired":
++			if stock != 20 || reserved != 7 {
++				t.Fatalf("run %d: expired but stock %d reserved %d, want 20 and 7", run, stock, reserved)
++			}
++		default:
++			t.Fatalf("run %d: status %s", run, s)
++		}
++	}
++}
++
++// commitLikeInventory is inventory-service's /commit for one order: claim, then move the stock.
++func commitLikeInventory(orderID int) {
++	tx, err := db.Begin()
++	if err != nil {
++		return
++	}
++	defer tx.Rollback()
++	var product string
++	var qty int
++	err = tx.QueryRow(`UPDATE reservations SET status = 'committed' WHERE order_id = $1 AND status = 'active' RETURNING product_id, quantity`, orderID).Scan(&product, &qty)
++	if err != nil {
++		return
++	}
++	tx.Exec(`UPDATE products SET stock = stock - $1, reserved = reserved - $1 WHERE id = $2`, qty, product)
++	tx.Commit()
++}
++
++func TestOneBadReservationDoesNotStopTheOthers(t *testing.T) {
++	setupHousekeepingDB(t)
++	addProduct(t, "p1", 20, 6)
++	addProduct(t, "p2", 20, 6)
++	a := addReservation(t, 1, "p1", 3, -5)
++	b := addReservation(t, 2, "p2", 3, -5)
++	// make the first one fail: its stock update would break a constraint
++	if _, err := db.Exec(`ALTER TABLE products ADD CONSTRAINT p1_reserved_fixed CHECK (id <> 'p1' OR reserved = 6) NOT VALID`); err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { db.Exec(`ALTER TABLE products DROP CONSTRAINT IF EXISTS p1_reserved_fixed`) })
++
++	expireReservations()
++
++	if s := reservationStatus(t, a); s != "active" {
++		t.Errorf("failed reservation: %s, want active (rolled back)", s)
++	}
++	if s := reservationStatus(t, b); s != "expired" {
++		t.Errorf("other reservation: %s, want expired", s)
++	}
++	if _, reserved := productCounts(t, "p1"); reserved != 6 {
++		t.Errorf("p1 reserved %d, want 6 (nothing half done)", reserved)
++	}
++}
++
++// --- retention ---
++
++func TestRetentionDeletesOldRowsAndKeepsRecentOnes(t *testing.T) {
++	setupHousekeepingDB(t)
++	id := insertOrder(t, "pending", 1)
++	mustExec(t, `INSERT INTO order_events (order_id, event_type, created_at) VALUES ($1, 'old', NOW() - interval '91 days'), ($1, 'new', NOW() - interval '89 days')`, id)
++	mustExec(t, `INSERT INTO order_outbox (event_type, payload, sent_at) VALUES
++		('sent-old', '{}', NOW() - interval '8 days'), ('sent-new', '{}', NOW() - interval '6 days'),
++		('unsent-old', '{}', NULL)`)
++	mustExec(t, `UPDATE order_outbox SET created_at = NOW() - interval '30 days' WHERE event_type = 'unsent-old'`)
++	mustExec(t, `INSERT INTO idempotency_keys (customer_id, key, request_hash, order_id, created_at) VALUES
++		('a', 'old', 'h', $1, NOW() - interval '25 hours'), ('a', 'new', 'h', $1, NOW() - interval '23 hours')`, id)
++	mustExec(t, `INSERT INTO notifications (recipient, channel, template, body, created_at) VALUES
++		('a', 'email', 't', 'b', NOW() - interval '91 days'), ('a', 'email', 't', 'b', NOW() - interval '89 days')`)
++
++	cleanupOldEvents()
++
++	checks := []struct {
++		what  string
++		query string
++		want  int
++	}{
++		{"order_events kept", `SELECT count(*) FROM order_events`, 1},
++		{"sent outbox kept", `SELECT count(*) FROM order_outbox WHERE event_type = 'sent-new'`, 1},
++		{"old sent outbox deleted", `SELECT count(*) FROM order_outbox WHERE event_type = 'sent-old'`, 0},
++		{"UNSENT outbox row is never deleted", `SELECT count(*) FROM order_outbox WHERE event_type = 'unsent-old'`, 1},
++		{"idempotency keys kept", `SELECT count(*) FROM idempotency_keys WHERE key = 'new'`, 1},
++		{"old idempotency key deleted", `SELECT count(*) FROM idempotency_keys WHERE key = 'old'`, 0},
++		{"notifications kept", `SELECT count(*) FROM notifications`, 1},
++	}
++	for _, c := range checks {
++		if got := countRows(t, c.query); got != c.want {
++			t.Errorf("%s: got %d, want %d", c.what, got, c.want)
++		}
++	}
++}
++
++// A table that does not exist yet (its service has not started) is logged and skipped.
++func TestRetentionCarriesOnWhenOneTableIsMissing(t *testing.T) {
++	setupHousekeepingDB(t)
++	mustExec(t, `INSERT INTO notifications (recipient, channel, template, body, created_at) VALUES ('a', 'email', 't', 'b', NOW() - interval '91 days')`)
++	rules := append([]retentionRule{{"missing", `DELETE FROM no_such_table WHERE $1 > 0`, 1}}, retentionRules...)
++
++	pruneOldRows(db, rules)
++
++	if n := countRows(t, `SELECT count(*) FROM notifications`); n != 0 {
++		t.Errorf("notifications: %d left, want 0 (the rule after the failing one must still run)", n)
++	}
++}
++
++func mustExec(t *testing.T, q string, args ...interface{}) {
++	t.Helper()
++	if _, err := db.Exec(q, args...); err != nil {
++		t.Fatalf("exec: %v\n%s", err, q)
++	}
++}
+diff --git a/services/scheduler/main.go b/services/scheduler/main.go
+index 7e29ff3..74aa0bb 100644
+--- a/services/scheduler/main.go
++++ b/services/scheduler/main.go
+@@ -103,38 +103,42 @@ func runEvery(ctx context.Context, interval time.Duration, name string, fn func(
+ 	}
+ }
+ 
+-// expireReservations releases inventory reservations that have expired
++// expireReservations puts back stock that was held for an order that never went through.
++//
++// The reservation is claimed first (active -> expired) and the stock is only returned if
++// that claim really changed a row, inside one transaction. The inventory-service's commit
++// and release use the same claim-then-act pattern on the same rows, so if an order is
++// committed or released at the very moment its hold times out, exactly one of them wins
++// and the stock is never given back twice.
+ func expireReservations() {
+-	// Find expired reservations and release them
+ 	rows, err := db.Query(
+-		`SELECT r.order_id, r.product_id, r.quantity
+-		 FROM reservations r
+-		 WHERE r.status = 'active' AND r.expires_at < NOW()`,
++		`SELECT id FROM reservations WHERE status = 'active' AND expires_at < NOW() ORDER BY id LIMIT 500`,
+ 	)
+ 	if err != nil {
+ 		log.Printf("expire_reservations query error: %v", err)
+ 		return
+ 	}
+-	defer rows.Close()
+-
+-	count := 0
++	var ids []int
+ 	for rows.Next() {
+-		var orderID int
+-		var productID string
+-		var quantity int
+-		rows.Scan(&orderID, &productID, &quantity)
++		var id int
++		if err := rows.Scan(&id); err != nil {
++			log.Printf("expire_reservations scan error: %v", err)
++			continue
++		}
++		ids = append(ids, id)
++	}
++	rows.Close()
+ 
+-		tx, err := db.Begin()
++	count := 0
++	for _, id := range ids {
++		expired, err := expireReservation(id)
+ 		if err != nil {
+-			log.Printf("expire_reservations begin error: %v", err)
++			log.Printf("expire_reservations: reservation %d: %v", id, err)
+ 			continue
+ 		}
+-		tx.Exec("UPDATE products SET reserved = GREATEST(reserved - $1, 0), updated_at = NOW() WHERE id = $2",
+-			quantity, productID)
+-		tx.Exec("UPDATE reservations SET status = 'expired' WHERE order_id = $1 AND product_id = $2 AND status = 'active'",
+-			orderID, productID)
+-		tx.Commit()
+-		count++
++		if expired {
++			count++
++		}
+ 	}
+ 
+ 	if count > 0 {
+@@ -142,6 +146,38 @@ func expireReservations() {
+ 	}
+ }
+ 
++// expireReservation expires one reservation if it is still active and past its time, and
++// returns its stock. It reports false when someone else got there first (committed,
++// released, or already expired), in which case nothing is changed.
++func expireReservation(id int) (bool, error) {
++	tx, err := db.Begin()
++	if err != nil {
++		return false, err
++	}
++	defer tx.Rollback()
++
++	var productID string
++	var quantity int
++	err = tx.QueryRow(
++		`UPDATE reservations SET status = 'expired'
++		 WHERE id = $1 AND status = 'active' AND expires_at < NOW()
++		 RETURNING product_id, quantity`, id,
++	).Scan(&productID, &quantity)
++	if errors.Is(err, sql.ErrNoRows) {
++		return false, nil
++	}
++	if err != nil {
++		return false, err
++	}
++	if _, err := tx.Exec(
++		`UPDATE products SET reserved = GREATEST(reserved - $1, 0), updated_at = NOW() WHERE id = $2`,
++		quantity, productID,
++	); err != nil {
++		return false, err
++	}
++	return true, tx.Commit()
++}
++
+ // An order that stays pending this long was never finished by the worker.
+ const abandonedAfter = 30 * time.Minute
+ 
+@@ -259,13 +295,12 @@ func cancelOrder(client *http.Client, baseURL string, orderID int) (bool, error)
+ 
+ // retryFailedPayments attempts to re-process failed payments
+ func retryFailedPayments() {
+-	cutoff := time.Now().Add(-1 * time.Hour)
+-
++	// The hour is counted by the database, not passed in from this process's clock.
+ 	var count int
+ 	db.QueryRow(
+ 		`SELECT COUNT(*) FROM payments
+-		 WHERE status = 'failed' AND created_at > $1`,
+-		cutoff,
++		 WHERE status = 'failed' AND created_at > NOW() - make_interval(secs => $1)`,
++		time.Hour.Seconds(),
+ 	).Scan(&count)
+ 
+ 	if count > 0 {
+@@ -280,12 +315,11 @@ func generateDigest() {
+ 	var totalOrders, pendingOrders, completedOrders int
+ 	var totalRevenue float64
+ 
+-	today := time.Now().UTC().Truncate(24 * time.Hour)
+-
+-	db.QueryRow("SELECT COUNT(*) FROM orders WHERE created_at >= $1", today).Scan(&totalOrders)
++	// "Today" is the database's own day (CURRENT_DATE), the same clock that stamped the rows.
++	db.QueryRow("SELECT COUNT(*) FROM orders WHERE created_at >= CURRENT_DATE").Scan(&totalOrders)
+ 	db.QueryRow("SELECT COUNT(*) FROM orders WHERE status = 'pending'").Scan(&pendingOrders)
+-	db.QueryRow("SELECT COUNT(*) FROM orders WHERE status = 'delivered' AND updated_at >= $1", today).Scan(&completedOrders)
+-	db.QueryRow("SELECT COALESCE(SUM(amount), 0) FROM payments WHERE status = 'completed' AND created_at >= $1", today).Scan(&totalRevenue)
++	db.QueryRow("SELECT COUNT(*) FROM orders WHERE status = 'delivered' AND updated_at >= CURRENT_DATE").Scan(&completedOrders)
++	db.QueryRow("SELECT COALESCE(SUM(amount), 0) FROM payments WHERE status = 'completed' AND created_at >= CURRENT_DATE").Scan(&totalRevenue)
+ 
+ 	log.Printf("Daily digest - Orders today: %d, Pending: %d, Completed: %d, Revenue: %.2f",
+ 		totalOrders, pendingOrders, completedOrders, totalRevenue)
+@@ -295,17 +329,7 @@ func generateDigest() {
+ 
+ // cleanupOldEvents removes old tracking/audit data
+ func cleanupOldEvents() {
+-	cutoff := time.Now().AddDate(0, 0, -90) // 90 days retention
+-
+-	result, err := db.Exec("DELETE FROM order_events WHERE created_at < $1", cutoff)
+-	if err != nil {
+-		log.Printf("cleanup error: %v", err)
+-		return
+-	}
+-
+-	if rows, _ := result.RowsAffected(); rows > 0 {
+-		log.Printf("Cleaned up %d old order events", rows)
+-	}
++	pruneOldRows(db, retentionRules)
+ }
+ 
+ func getEnv(key, fallback string) string {
+diff --git a/services/scheduler/retention.go b/services/scheduler/retention.go
+new file mode 100644
+index 0000000..3a12a91
+--- /dev/null
++++ b/services/scheduler/retention.go
+@@ -0,0 +1,47 @@
++package main
++
++// Retention: how long each table keeps its rows. Without this the outbox, the
++// idempotency keys and the notification history only ever grow.
++//
++// The cut-off is worked out by Postgres (NOW() - an interval), never by the Go clock.
++// Several of these columns are TIMESTAMP without a time zone, and handing the database
++// a Go time makes it compare wall-clock readings, which is wrong whenever this process and
++// the database are in different zones (the same bug that cancelled young orders).
++
++import (
++	"database/sql"
++	"log"
++	"time"
++)
++
++type retentionRule struct {
++	table string
++	// sql must delete the old rows and take the age in seconds as $1.
++	sql string
++	age time.Duration
++}
++
++var retentionRules = []retentionRule{
++	{"order_events", `DELETE FROM order_events WHERE created_at < NOW() - make_interval(secs => $1)`, 90 * 24 * time.Hour},
++	// Only rows the relay has delivered. An unsent row is an order event still waiting
++	// to leave, however old it is, so it is never deleted here.
++	{"order_outbox", `DELETE FROM order_outbox WHERE sent_at IS NOT NULL AND sent_at < NOW() - make_interval(secs => $1)`, 7 * 24 * time.Hour},
++	// A retry after 24 hours is a new attempt, not a retry of the old one.
++	{"idempotency_keys", `DELETE FROM idempotency_keys WHERE created_at < NOW() - make_interval(secs => $1)`, 24 * time.Hour},
++	{"notifications", `DELETE FROM notifications WHERE created_at < NOW() - make_interval(secs => $1)`, 90 * 24 * time.Hour},
++}
++
++// pruneOldRows applies every rule. A failing rule (for example a table its owning service
++// has not created yet) is logged and the others still run.
++func pruneOldRows(conn *sql.DB, rules []retentionRule) {
++	for _, r := range rules {
++		res, err := conn.Exec(r.sql, r.age.Seconds())
++		if err != nil {
++			log.Printf("retention: %s: %v", r.table, err)
++			continue
++		}
++		if n, _ := res.RowsAffected(); n > 0 {
++			log.Printf("retention: deleted %d rows from %s older than %s", n, r.table, r.age)
++		}
++	}
++}
+diff --git a/services/shipping-service/main.go b/services/shipping-service/main.go
+index 748be47..508010c 100644
+--- a/services/shipping-service/main.go
++++ b/services/shipping-service/main.go
+@@ -335,11 +335,21 @@ func handleShipmentByOrder(w http.ResponseWriter, r *http.Request) {
+ 		httpError(w, "invalid request body", http.StatusBadRequest)
+ 		return
+ 	}
+-	description, ok := shipmentSteps[req.Status]
+-	if !ok {
++	if _, ok := shipmentSteps[req.Status]; !ok {
+ 		httpError(w, "status must be in_transit, delivered or cancelled", http.StatusBadRequest)
+ 		return
+ 	}
++	moveShipmentByOrder(w, orderID, req.Status, "", "")
++}
++
++// moveShipmentByOrder applies one status change to an order's shipment, forward only.
++// location and description are optional; the shipment's city and the standard wording
++// for the step are used when they are empty. Both the worker's PUT and the carrier
++// webhook come through here, so they follow the same rules.
++func moveShipmentByOrder(w http.ResponseWriter, orderID int, status, location, description string) {
++	if description == "" {
++		description = shipmentSteps[status]
++	}
+ 
+ 	tx, err := db.Begin()
+ 	if err != nil {
+@@ -378,13 +388,13 @@ func handleShipmentByOrder(w http.ResponseWriter, r *http.Request) {
+ 	forward := false
+ 	switch {
+ 	case current == "cancelled" || current == "delivered":
+-	case req.Status == "cancelled":
++	case status == "cancelled":
+ 		forward = true
+ 	default:
+-		forward = shipmentRank[req.Status] > shipmentRank[current]
++		forward = shipmentRank[status] > shipmentRank[current]
+ 	}
+ 	if !forward {
+-		log.Printf("Shipment for order %d is %s, ignoring request for %s", orderID, current, req.Status)
++		log.Printf("Shipment for order %d is %s, ignoring request for %s", orderID, current, status)
+ 		respond(false, current)
+ 		return
+ 	}
+@@ -394,7 +404,7 @@ func handleShipmentByOrder(w http.ResponseWriter, r *http.Request) {
+ 		        shipped_at = CASE WHEN $1::text IN ('in_transit', 'delivered') THEN COALESCE(shipped_at, NOW()) ELSE shipped_at END,
+ 		        delivered_at = CASE WHEN $1::text = 'delivered' THEN NOW() ELSE delivered_at END
+ 		 WHERE id = $2`,
+-		req.Status, shipmentID,
++		status, shipmentID,
+ 	); err != nil {
+ 		log.Printf("update shipment %d: %v", shipmentID, err)
+ 		httpError(w, "failed to update shipment", http.StatusInternalServerError)
+@@ -403,7 +413,7 @@ func handleShipmentByOrder(w http.ResponseWriter, r *http.Request) {
+ 	if _, err := tx.Exec(
+ 		`INSERT INTO tracking_events (shipment_id, status, location, description, occurred_at)
+ 		 VALUES ($1, $2, $3, $4, NOW())`,
+-		shipmentID, req.Status, city.String, description,
++		shipmentID, status, orDefault(location, city.String), description,
+ 	); err != nil {
+ 		log.Printf("tracking event for shipment %d: %v", shipmentID, err)
+ 		httpError(w, "failed to update shipment", http.StatusInternalServerError)
+@@ -415,13 +425,13 @@ func handleShipmentByOrder(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
+-	publishEvent("shipment."+req.Status, map[string]interface{}{
++	publishEvent("shipment."+status, map[string]interface{}{
+ 		"shipment_id":     shipmentID,
+ 		"order_id":        orderID,
+ 		"tracking_number": tracking,
+-		"status":          req.Status,
++		"status":          status,
+ 	})
+-	respond(true, req.Status)
++	respond(true, status)
+ }
+ 
+ func handleShipment(w http.ResponseWriter, r *http.Request) {
+@@ -534,42 +544,37 @@ func handleCarrierWebhook(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
+-	var shipmentID, orderID int
++	// The webhook is open to the internet, so it only accepts what a carrier can really
++	// report. Cancelling is our own decision (the order was cancelled), never the carrier's.
++	if req.TrackingNumber == "" {
++		httpError(w, "tracking_number is required", http.StatusBadRequest)
++		return
++	}
++	if req.Status != "in_transit" && req.Status != "delivered" {
++		httpError(w, "status must be in_transit or delivered", http.StatusBadRequest)
++		return
++	}
++
++	var orderID int
+ 	err := db.QueryRow(
+-		"SELECT id, order_id FROM shipments WHERE tracking_number = $1",
++		"SELECT order_id FROM shipments WHERE tracking_number = $1",
+ 		req.TrackingNumber,
+-	).Scan(&shipmentID, &orderID)
++	).Scan(&orderID)
+ 	if err != nil {
+ 		httpError(w, "tracking number not found", http.StatusNotFound)
+ 		return
+ 	}
+ 
+-	// Update shipment status
+-	db.Exec("UPDATE shipments SET status = $1, updated_at = NOW() WHERE id = $2", req.Status, shipmentID)
++	// Same forward-only, repeat-safe move the worker uses: a replayed or late "in_transit"
++	// after "delivered" changes nothing, and a cancelled shipment stays cancelled.
++	moveShipmentByOrder(w, orderID, req.Status, req.Location, req.Description)
++}
+ 
+-	if req.Status == "delivered" {
+-		db.Exec("UPDATE shipments SET delivered_at = NOW() WHERE id = $1", shipmentID)
+-	} else if req.Status == "in_transit" {
+-		db.Exec("UPDATE shipments SET shipped_at = COALESCE(shipped_at, NOW()) WHERE id = $1", shipmentID)
++func orDefault(v, fallback string) string {
++	if v == "" {
++		return fallback
+ 	}
+-
+-	// Record tracking event
+-	db.Exec(
+-		`INSERT INTO tracking_events (shipment_id, status, location, description, occurred_at)
+-		 VALUES ($1, $2, $3, $4, NOW())`,
+-		shipmentID, req.Status, req.Location, req.Description,
+-	)
+-
+-	publishEvent("shipment."+req.Status, map[string]interface{}{
+-		"shipment_id":     shipmentID,
+-		"order_id":        orderID,
+-		"tracking_number": req.TrackingNumber,
+-		"status":          req.Status,
+-		"location":        req.Location,
+-	})
+-
+-	w.Header().Set("Content-Type", "application/json")
+-	json.NewEncoder(w).Encode(map[string]string{"status": "accepted"})
++	return v
+ }
+ 
+ func generateTrackingNumber(carrier string) string {
+diff --git a/services/shipping-service/main_test.go b/services/shipping-service/main_test.go
+index 9d4908b..9ad122b 100644
+--- a/services/shipping-service/main_test.go
++++ b/services/shipping-service/main_test.go
+@@ -247,3 +247,104 @@ func TestConcurrentMovesRecordOneEvent(t *testing.T) {
+ 		t.Errorf("%d in_transit events, want 1", n)
+ 	}
+ }
++
++// --- Carrier webhook (open to the internet through the gateway) ---
++
++func webhook(t *testing.T, body string) (int, map[string]interface{}) {
++	t.Helper()
++	rec := httptest.NewRecorder()
++	handleCarrierWebhook(rec, httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewBufferString(body)))
++	var resp map[string]interface{}
++	json.NewDecoder(rec.Body).Decode(&resp)
++	return rec.Code, resp
++}
++
++func trackingOf(t *testing.T, orderID int) string {
++	t.Helper()
++	var tn string
++	if err := db.QueryRow(`SELECT tracking_number FROM shipments WHERE order_id = $1`, orderID).Scan(&tn); err != nil {
++		t.Fatalf("tracking: %v", err)
++	}
++	return tn
++}
++
++func TestWebhookMovesShipmentForward(t *testing.T) {
++	setupTestDB(t)
++	createFor(t, 42)
++	tn := trackingOf(t, 42)
++
++	if code, _ := webhook(t, `{"tracking_number":"`+tn+`","status":"in_transit","location":"Leeds hub"}`); code != http.StatusOK {
++		t.Fatalf("in_transit: got %d", code)
++	}
++	if code, _ := webhook(t, `{"tracking_number":"`+tn+`","status":"delivered"}`); code != http.StatusOK {
++		t.Fatalf("delivered: got %d", code)
++	}
++	if s := statusOf(t, 42); s != "delivered" {
++		t.Errorf("status: got %s, want delivered", s)
++	}
++	var loc string
++	db.QueryRow(`SELECT location FROM tracking_events e JOIN shipments s ON s.id = e.shipment_id WHERE s.order_id = 42 AND e.status = 'in_transit'`).Scan(&loc)
++	if loc != "Leeds hub" {
++		t.Errorf("location: got %q, want the carrier's Leeds hub", loc)
++	}
++}
++
++// Anyone can reach the webhook, so a made-up status must not be written to the database
++// or published as a "shipment.<anything>" event.
++func TestWebhookRejectsStatusesACarrierCannotSend(t *testing.T) {
++	setupTestDB(t)
++	createFor(t, 42)
++	tn := trackingOf(t, 42)
++
++	for _, status := range []string{"cancelled", "label_created", "hacked", "", "delivered; DROP TABLE shipments"} {
++		body, _ := json.Marshal(map[string]string{"tracking_number": tn, "status": status})
++		if code, _ := webhook(t, string(body)); code != http.StatusBadRequest {
++			t.Errorf("status %q: got %d, want 400", status, code)
++		}
++	}
++	if s := statusOf(t, 42); s != "label_created" {
++		t.Errorf("status changed to %q", s)
++	}
++	if n := eventCount(t, 42, "hacked"); n != 0 {
++		t.Errorf("a made-up status reached tracking_events")
++	}
++}
++
++func TestWebhookNeedsAKnownTrackingNumber(t *testing.T) {
++	setupTestDB(t)
++	createFor(t, 42)
++	if code, _ := webhook(t, `{"status":"delivered"}`); code != http.StatusBadRequest {
++		t.Errorf("no tracking number: got %d, want 400", code)
++	}
++	if code, _ := webhook(t, `{"tracking_number":"NOPE","status":"delivered"}`); code != http.StatusNotFound {
++		t.Errorf("unknown tracking number: got %d, want 404", code)
++	}
++	if s := statusOf(t, 42); s != "label_created" {
++		t.Errorf("status changed to %q", s)
++	}
++}
++
++// A carrier retries and sends events late. A repeat, or an old "in_transit" after "delivered",
++// changes nothing; and a shipment we cancelled cannot be brought back by the carrier.
++func TestWebhookIsSafeToRepeatAndNeverMovesBackwards(t *testing.T) {
++	setupTestDB(t)
++	createFor(t, 42)
++	tn := trackingOf(t, 42)
++	webhook(t, `{"tracking_number":"`+tn+`","status":"delivered"}`)
++	webhook(t, `{"tracking_number":"`+tn+`","status":"delivered"}`)
++	webhook(t, `{"tracking_number":"`+tn+`","status":"in_transit"}`)
++	if s := statusOf(t, 42); s != "delivered" {
++		t.Errorf("status: got %s, want delivered", s)
++	}
++	if n := eventCount(t, 42, "delivered"); n != 1 {
++		t.Errorf("delivered events: got %d, want 1", n)
++	}
++
++	createFor(t, 43)
++	tn2 := trackingOf(t, 43)
++	moveTo(t, 43, "cancelled")
++	webhook(t, `{"tracking_number":"`+tn2+`","status":"in_transit"}`)
++	if s := statusOf(t, 43); s != "cancelled" {
++		t.Errorf("a cancelled shipment became %s", s)
++	}
++}
+diff --git a/services/worker/main.go b/services/worker/main.go
+index ddabb92..07d7339 100644
+--- a/services/worker/main.go
++++ b/services/worker/main.go
+@@ -4,6 +4,7 @@ import (
+ 	"bytes"
+ 	"context"
+ 	"encoding/json"
++	"errors"
+ 	"fmt"
+ 	"io"
+ 	"log"
+@@ -162,7 +163,7 @@ func handleEvent(client *http.Client, services map[string]string, event Event) e
+ //	processing -> shipment created (label)
+ //	shipped    -> shipment in transit, "order shipped" email with the tracking number
+ //	delivered  -> shipment delivered, "order delivered" email
+-//	cancelled  -> stock and money back, shipment cancelled
++//	cancelled  -> stock and money back, shipment cancelled, "order cancelled" email
+ func handleStatusChange(client *http.Client, services map[string]string, orderID int, newStatus string) error {
+ 	switch newStatus {
+ 	case "cancelled":
+@@ -170,7 +171,17 @@ func handleStatusChange(client *http.Client, services map[string]string, orderID
+ 		if err := undoOrder(client, services, orderID); err != nil {
+ 			return err
+ 		}
+-		return cancelShipment(client, services, orderID)
++		if err := cancelShipment(client, services, orderID); err != nil {
++			return err
++		}
++		// Last, and not best effort: a failed email returns an error so the message comes
++		// back. Every step above is safe to repeat and the email is sent once per order
++		// (dedupe key), so a retry only finishes what is missing.
++		order, err := getOrder(client, services, orderID)
++		if err != nil {
++			return err
++		}
++		return notifyCustomer(client, services, order, "order_cancelled", "")
+ 	case "confirmed", "processing", "shipped", "delivered":
+ 		// handled below
+ 	default:
+@@ -252,7 +263,7 @@ func processNewOrder(client *http.Client, services map[string]string, o newOrder
+ 		// confirmed or later: the charge already went through. Make sure the stock is
+ 		// committed; committing twice changes nothing.
+ 		log.Printf("  -> order %d: already %s, making sure its stock is committed", o.OrderID, status)
+-		return commitStock(client, services, o.OrderID)
++		return commitOrHoldAgain(client, services, o)
+ 	}
+ 
+ 	code, err := sendJSON(client, http.MethodPost, services["inventory"]+"/reserve", map[string]interface{}{
+@@ -308,7 +319,35 @@ func processNewOrder(client *http.Client, services map[string]string, o newOrder
+ 
+ 	// Turn the held stock into a sale (ALPHA-77). Only after the confirm, so stock never
+ 	// leaves the shelf for an order that isn't confirmed.
+-	return commitStock(client, services, o.OrderID)
++	return commitOrHoldAgain(client, services, o)
++}
++
++// commitOrHoldAgain commits the order's stock. If the hold has expired (inventory-service
++// answers 409) the customer has already paid, so it takes the stock again; if there is none
++// left it cancels the order, and the cancel handling refunds the charge. Without this a paid
++// order could finish with the stock never leaving the shelf.
++func commitOrHoldAgain(client *http.Client, services map[string]string, o newOrder) error {
++	err := commitStock(client, services, o.OrderID)
++	if !errors.Is(err, errHoldGone) {
++		return err
++	}
++	log.Printf("  -> order %d: its stock hold expired before the commit, holding it again", o.OrderID)
++	code, rerr := sendJSON(client, http.MethodPost, services["inventory"]+"/reserve", map[string]interface{}{
++		"order_id": o.OrderID,
++		"items":    o.Items,
++	})
++	if rerr != nil {
++		return fmt.Errorf("reserve again: %w", rerr)
++	}
++	switch code {
++	case http.StatusCreated, http.StatusOK:
++		return commitStock(client, services, o.OrderID)
++	case http.StatusConflict, http.StatusNotFound:
++		log.Printf("  -> order %d: paid but the stock is gone, cancelling so it is refunded", o.OrderID)
++		return setOrderStatus(client, services, o.OrderID, "cancelled")
++	default:
++		return fmt.Errorf("reserve again: unexpected status %d", code)
++	}
+ }
+ 
+ // undoOrder gives a cancelled order back everything it took: releases stock still held,
+@@ -503,12 +542,18 @@ func commitStock(client *http.Client, services map[string]string, orderID int) e
+ 	if err != nil {
+ 		return fmt.Errorf("commit stock: %w", err)
+ 	}
++	if code == http.StatusConflict {
++		return errHoldGone
++	}
+ 	if code != http.StatusOK {
+ 		return fmt.Errorf("commit stock: unexpected status %d", code)
+ 	}
+ 	return nil
+ }
+ 
++// errHoldGone means inventory-service has no active hold to commit for the order.
++var errHoldGone = errors.New("commit stock: the hold is gone")
++
+ func setOrderStatus(client *http.Client, services map[string]string, orderID int, status string) error {
+ 	code, err := sendJSON(client, http.MethodPut, services["order"]+"/status", map[string]interface{}{
+ 		"order_id":   orderID,
+diff --git a/services/worker/main_test.go b/services/worker/main_test.go
+index b7148a4..e05b5c2 100644
+--- a/services/worker/main_test.go
++++ b/services/worker/main_test.go
+@@ -26,6 +26,7 @@ type fakeServices struct {
+ 	calls       []string
+ 	bodies      map[string]map[string]interface{} // call -> last JSON body sent
+ 	codes       map[string]int                    // path -> status code, default 200
++	seq         map[string][]int                  // path -> codes for the next calls, used before codes
+ 	orderStatus string                            // what GET /42 reports, default "pending"
+ }
+ 
+@@ -56,6 +57,10 @@ func newFakeServicesWithStatus(t *testing.T, codes map[string]int, orderStatus s
+ 		f.calls = append(f.calls, call)
+ 		f.bodies[call] = body
+ 		code, ok := f.codes[r.URL.Path]
++		if q := f.seq[r.URL.Path]; len(q) > 0 {
++			code, ok = q[0], true
++			f.seq[r.URL.Path] = q[1:]
++		}
+ 		f.mu.Unlock()
+ 		if !ok {
+ 			code = http.StatusOK
+@@ -271,7 +276,7 @@ func TestCancelledOrderGetsStockAndMoneyBack(t *testing.T) {
+ 	if err != nil {
+ 		t.Fatalf("got error %v, want nil", err)
+ 	}
+-	assertCalls(t, calls, []string{"POST /release", "POST /restock", "POST /refund", "PUT /shipments/by-order/42 cancelled"})
++	assertCalls(t, calls, []string{"POST /release", "POST /restock", "POST /refund", "PUT /shipments/by-order/42 cancelled", "GET /42", "POST /send order_cancelled"})
+ }
+ 
+ // Order that never got charged: payment-service answers 404 and that is fine.
+@@ -280,7 +285,7 @@ func TestCancelledOrderThatWasNeverChargedIsStillFine(t *testing.T) {
+ 	if err != nil {
+ 		t.Fatalf("got error %v, want nil (nothing to refund, no shipment to cancel)", err)
+ 	}
+-	assertCalls(t, calls, []string{"POST /release", "POST /restock", "POST /refund", "PUT /shipments/by-order/42 cancelled"})
++	assertCalls(t, calls, []string{"POST /release", "POST /restock", "POST /refund", "PUT /shipments/by-order/42 cancelled", "GET /42", "POST /send order_cancelled"})
+ }
+ 
+ func runStatus(t *testing.T, codes map[string]int, orderStatus string, event Event) (*fakeServices, error) {
+@@ -417,3 +422,78 @@ func TestBadStatusChangedPayloadKeepsMessageForRetry(t *testing.T) {
+ 		t.Fatal("got nil, want an error")
+ 	}
+ }
++
++// The customer is told when their order is cancelled, whatever the reason, and once only.
++func TestCancelledOrderEmailsTheCustomerOnce(t *testing.T) {
++	f, err := runStatus(t, nil, "cancelled", statusChanged(t, "pending", "cancelled"))
++	if err != nil {
++		t.Fatalf("got error %v, want nil", err)
++	}
++	sent := f.bodies["POST /send order_cancelled"]
++	if sent["recipient"] != "sara@example.com" || sent["dedupe_key"] != "order_cancelled:42" {
++		t.Errorf("email: %v, want to sara@example.com with dedupe key order_cancelled:42", sent)
++	}
++}
++
++// Unlike the payment-failed email, this one must not be lost: if it cannot be sent the
++// message goes back on the queue, and the retry (everything before it is safe to repeat)
++// sends it.
++func TestCancelledEmailFailureKeepsEventForRetry(t *testing.T) {
++	f, err := runStatus(t, map[string]int{"/send": 500}, "cancelled", statusChanged(t, "confirmed", "cancelled"))
++	if err == nil {
++		t.Fatal("got nil, want an error so the email is not forgotten")
++	}
++	assertCalls(t, f.calls, []string{"POST /release", "POST /restock", "POST /refund", "PUT /shipments/by-order/42 cancelled", "GET /42", "POST /send order_cancelled"})
++}
++
++func TestCancelledEventWhenOrderLookupFailsKeepsEventForRetry(t *testing.T) {
++	_, err := run(t, map[string]int{"/42": 500}, statusChanged(t, "confirmed", "cancelled"))
++	if err == nil {
++		t.Fatal("got nil, want an error")
++	}
++}
++
++// --- the hold expired before the commit (the customer has already paid) ---
++
++func runSeq(t *testing.T, seq map[string][]int, orderStatus string, event Event, codes map[string]int) ([]string, error) {
++	t.Helper()
++	f, services := newFakeServicesWithStatus(t, codes, orderStatus)
++	f.seq = seq
++	err := handleEvent(&http.Client{Timeout: 2 * time.Second}, services, event)
++	return f.calls, err
++}
++
++func TestExpiredHoldIsTakenAgainAndCommitted(t *testing.T) {
++	calls, err := runSeq(t, map[string][]int{"/commit": {409, 200}}, "pending", orderCreated(t), map[string]int{"/reserve": 201, "/charge": 201})
++	if err != nil {
++		t.Fatalf("got error %v, want nil", err)
++	}
++	assertCalls(t, calls, []string{"GET /42", "POST /reserve", "POST /charge", "PUT /status confirmed", "POST /commit", "POST /reserve", "POST /commit"})
++}
++
++// Paid, but the stock was sold to someone else while the hold was gone: cancel so the
++// charge is refunded (the cancel event does the refund).
++func TestExpiredHoldWithNoStockLeftCancelsThePaidOrder(t *testing.T) {
++	calls, err := runSeq(t, map[string][]int{"/commit": {409}, "/reserve": {201, 409}}, "pending", orderCreated(t), map[string]int{"/charge": 201})
++	if err != nil {
++		t.Fatalf("got error %v, want nil (final answer)", err)
++	}
++	assertCalls(t, calls, []string{"GET /42", "POST /reserve", "POST /charge", "PUT /status confirmed", "POST /commit", "POST /reserve", "PUT /status cancelled"})
++}
++
++// The same message redelivered much later (a DLQ redrive): the order is confirmed but its
++// hold is long gone.
++func TestRedeliveredConfirmedOrderWithExpiredHoldHoldsAgain(t *testing.T) {
++	calls, err := runSeq(t, map[string][]int{"/commit": {409, 200}}, "confirmed", orderCreated(t), nil)
++	if err != nil {
++		t.Fatalf("got error %v, want nil", err)
++	}
++	assertCalls(t, calls, []string{"GET /42", "POST /commit", "POST /reserve", "POST /commit"})
++}
++
++func TestReserveAgainOutageKeepsMessageForRetry(t *testing.T) {
++	_, err := runSeq(t, map[string][]int{"/commit": {409}, "/reserve": {201, 500}}, "pending", orderCreated(t), map[string]int{"/charge": 201})
++	if err == nil {
++		t.Fatal("got nil, want an error so SQS retries")
++	}
++}

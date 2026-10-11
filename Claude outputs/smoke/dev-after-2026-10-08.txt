@@ -1,0 +1,37 @@
+WARNING: TLS certificate checks are off (-insecure)
+Smoke test against https://dashboard.dev.eksv2.naimaosmann.com  (2026-10-08T11:13:22+03:00)
+
+PASS  health: orders                                             HTTP 200 
+PASS  health: inventory                                          HTTP 200 
+PASS  health: payments                                           HTTP 200 
+PASS  health: notifications                                      HTTP 200 
+PASS  health: shipping                                           HTTP 200 
+PASS  login                                                      HTTP 200 
+PASS  pick a product with stock                                  mon-001
+      using mon-001 (27 inch Monitor): stock 49, reserved 0
+PASS  place order                                                HTTP 201, order #5  {"id":5,"status":"pending","total":199}
+PASS  retry with same Idempotency-Key returns the same order     #5
+PASS  order confirmed by the worker (reserve -> charge -> commit) #5
+PASS  stock committed (stock -1, reserved back to before)        stock 49 -> 48 (want 48), reserved 0 -> 0 (want 0)
+PASS  payment charge in the ledger                               Order #5 payment
+PASS  order_confirmed email                                      
+PASS  advance to processing                                      HTTP 200  {"changed":true,"new_status":"processing","old_status":"confirmed","order_id":5}
+PASS  advance to shipped                                         HTTP 200  {"changed":true,"new_status":"shipped","old_status":"processing","order_id":5}
+PASS  advance to delivered                                       HTTP 200  {"changed":true,"new_status":"delivered","old_status":"shipped","order_id":5}
+PASS  shipment created and delivered                             shipment status: delivered
+PASS  order_shipped email                                        
+PASS  order_delivered email                                      
+PASS  place second order (to cancel)                             HTTP 201, order #6
+PASS  order confirmed by the worker (reserve -> charge -> commit) #6
+PASS  cancel the paid order                                      HTTP 200  {"changed":true,"new_status":"cancelled","old_status":"confirmed","order_id":6}
+PASS  refund in the ledger                                       Order #6 refund
+PASS  stock returned after cancel                                stock 48 (want 48), reserved 0 (want 0)
+PASS  order_cancelled email                                      
+PASS  blocked from outside: POST /api/payments/charge            HTTP 404 
+PASS  blocked from outside: POST /api/payments/refund            HTTP 404 
+PASS  blocked from outside: POST /api/inventory/reserve          HTTP 404 
+PASS  blocked from outside: POST /api/inventory/restock          HTTP 404 
+PASS  blocked from outside: POST /api/shipping/shipments         HTTP 404 
+PASS  blocked from outside: POST /api/notifications/send         HTTP 404 
+
+all steps passed

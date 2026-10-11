@@ -1,0 +1,1051 @@
+diff --git a/.gitattributes b/.gitattributes
+index 6313b56..ed133bb 100644
+--- a/.gitattributes
++++ b/.gitattributes
+@@ -1 +1,5 @@
+ * text=auto eol=lf
++*.sh text eol=lf
++*.tf text eol=lf
++*.hcl text eol=lf
++Makefile text eol=lf
+diff --git a/.gitignore b/.gitignore
+index a25ad7f..3906881 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -31,6 +31,7 @@ kubeconfig
+ 
+ # IDE
+ .vscode/
++Claude outputs/
+ .idea/
+ *.swp
+ *.swo
+diff --git a/docker-compose.yml b/docker-compose.yml
+index d9694cf..4d0d107 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -45,11 +45,18 @@ services:
+     build: ./services/api-gateway
+     ports:
+       - "8080:8080"
++      - "9091:9090"   # Prometheus metrics (separate port, never routed)
+     environment:
+       <<: *service-urls
+       REDIS_URL: redis://redis:6379
+       JWT_SECRET: local-dev-secret
+       DASHBOARD_SERVICE_URL: http://dashboard-api:8086
++      # Rate limits per window (defaults shown). No proxy locally, so no trusted proxies.
++      RATE_LIMIT_WINDOW_SECONDS: "60"
++      RATE_LIMIT_USER_PER_WINDOW: "120"
++      RATE_LIMIT_IP_PER_WINDOW: "60"
++      RATE_LIMIT_SENSITIVE_PER_WINDOW: "20"
++      TRUSTED_PROXY_CIDRS: ""
+     depends_on:
+       - redis
+ 
+@@ -59,6 +66,7 @@ services:
+       - "8081:8081"
+     environment:
+       <<: [*database-env, *floci-env]
++      PGAPPNAME: order-service
+     depends_on:
+       - postgres
+       - floci
+@@ -67,8 +75,10 @@ services:
+     build: ./services/inventory-service
+     ports:
+       - "8082:8082"
++      - "9092:9090"   # Prometheus metrics (separate port, not routed by api-gateway)
+     environment:
+       <<: *database-env
++      PGAPPNAME: inventory-service
+     depends_on:
+       - postgres
+ 
+@@ -78,6 +88,7 @@ services:
+       - "8083:8083"
+     environment:
+       <<: [*database-env, *floci-env]
++      PGAPPNAME: payment-service
+     depends_on:
+       - postgres
+       - floci
+@@ -88,6 +99,7 @@ services:
+       - "8084:8084"
+     environment:
+       <<: *database-env
++      PGAPPNAME: notification-service
+     depends_on:
+       - postgres
+ 
+@@ -97,6 +109,7 @@ services:
+       - "8085:8085"
+     environment:
+       <<: [*database-env, *floci-env]
++      PGAPPNAME: shipping-service
+     depends_on:
+       - postgres
+       - floci
+@@ -111,9 +124,11 @@ services:
+   scheduler:
+     build: ./services/scheduler
+     environment:
+-      <<: *database-env
++      <<: [*database-env, *floci-env]
++      PGAPPNAME: scheduler
+     depends_on:
+       - postgres
++      - floci
+ 
+   dashboard-api:
+     build: ./services/dashboard-api
+@@ -121,6 +136,7 @@ services:
+       - "8086:8086"
+     environment:
+       <<: *database-env
++      PGAPPNAME: dashboard-api
+     depends_on:
+       - postgres
+ 
+diff --git a/services/api-gateway/go.mod b/services/api-gateway/go.mod
+index 8c2f6af..ae0de87 100644
+--- a/services/api-gateway/go.mod
++++ b/services/api-gateway/go.mod
+@@ -1,13 +1,24 @@
+ module github.com/CoderCo-Learning/ecs-v3/services/api-gateway
+ 
+-go 1.22
++go 1.23.0
+ 
+ require (
+ 	github.com/go-redis/redis/v8 v8.11.5
+ 	github.com/golang-jwt/jwt/v5 v5.2.1
++	github.com/prometheus/client_golang v1.23.2
+ )
+ 
+ require (
+-	github.com/cespare/xxhash/v2 v2.1.2 // indirect
++	github.com/beorn7/perks v1.0.1 // indirect
++	github.com/cespare/xxhash/v2 v2.3.0 // indirect
+ 	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect
++	github.com/kr/text v0.2.0 // indirect
++	github.com/kylelemons/godebug v1.1.0 // indirect
++	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
++	github.com/prometheus/client_model v0.6.2 // indirect
++	github.com/prometheus/common v0.66.1 // indirect
++	github.com/prometheus/procfs v0.16.1 // indirect
++	go.yaml.in/yaml/v2 v2.4.2 // indirect
++	golang.org/x/sys v0.35.0 // indirect
++	google.golang.org/protobuf v1.36.8 // indirect
+ )
+diff --git a/services/api-gateway/go.sum b/services/api-gateway/go.sum
+index fc64049..514d3fd 100644
+--- a/services/api-gateway/go.sum
++++ b/services/api-gateway/go.sum
+@@ -1,5 +1,10 @@
+-github.com/cespare/xxhash/v2 v2.1.2 h1:YRXhKfTDauu4ajMg1TPgFO5jnlC2HCbmLXMcTG5cbYE=
+-github.com/cespare/xxhash/v2 v2.1.2/go.mod h1:VGX0DQ3Q6kWi7AoAeZDth3/j3BFtOZR5XLFGgcrjCOs=
++github.com/beorn7/perks v1.0.1 h1:VlbKKnNfV8bJzeqoa4cOKqO6bYr3WgKZxO8Z16+hsOM=
++github.com/beorn7/perks v1.0.1/go.mod h1:G2ZrVWU2WbWT9wwq4/hrbKbnv/1ERSJQ0ibhJ6rlkpw=
++github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=
++github.com/cespare/xxhash/v2 v2.3.0/go.mod h1:VGX0DQ3Q6kWi7AoAeZDth3/j3BFtOZR5XLFGgcrjCOs=
++github.com/creack/pty v1.1.9/go.mod h1:oKZEueFk5CKHvIhNR5MUki03XCEU+Q6VDXinZuGJ33E=
++github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
++github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
+ github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f h1:lO4WD4F/rVNCu3HqELle0jiPLLBs70cWOduZpkS1E78=
+ github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f/go.mod h1:cuUVRXasLTGF7a8hSLbxyZXjz+1KgoB3wDUb6vlszIc=
+ github.com/fsnotify/fsnotify v1.4.9 h1:hsms1Qyu0jgnwNXIxa+/V/PDsU6CfLf6CNO8H7IWoS4=
+@@ -8,19 +13,56 @@ github.com/go-redis/redis/v8 v8.11.5 h1:AcZZR7igkdvfVmQTPnu9WE37LRrO/YrBH5zWyjDC
+ github.com/go-redis/redis/v8 v8.11.5/go.mod h1:gREzHqY1hg6oD9ngVRbLStwAWKhA0FEgq8Jd4h5lpwo=
+ github.com/golang-jwt/jwt/v5 v5.2.1 h1:OuVbFODueb089Lh128TAcimifWaLhJwVflnrgM17wHk=
+ github.com/golang-jwt/jwt/v5 v5.2.1/go.mod h1:pqrtFR0X4osieyHYxtmOUWsAWrfe1Q5UVIyoH402zdk=
++github.com/google/go-cmp v0.7.0 h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=
++github.com/google/go-cmp v0.7.0/go.mod h1:pXiqmnSA92OHEEa9HXL2W4E7lf9JzCmGVUdgjX3N/iU=
++github.com/klauspost/compress v1.18.0 h1:c/Cqfb0r+Yi+JtIEq73FWXVkRonBlf0CRNYc8Zttxdo=
++github.com/klauspost/compress v1.18.0/go.mod h1:2Pp+KzxcywXVXMr50+X0Q/Lsb43OQHYWRCY2AiWywWQ=
++github.com/kr/pretty v0.3.1 h1:flRD4NNwYAUpkphVc1HcthR4KEIFJ65n8Mw5qdRn3LE=
++github.com/kr/pretty v0.3.1/go.mod h1:hoEshYVHaxMs3cyo3Yncou5ZscifuDolrwPKZanG3xk=
++github.com/kr/text v0.2.0 h1:5Nx0Ya0ZqY2ygV366QzturHI13Jq95ApcVaJBhpS+AY=
++github.com/kr/text v0.2.0/go.mod h1:eLer722TekiGuMkidMxC/pM04lWEeraHUUmBw8l2grE=
++github.com/kylelemons/godebug v1.1.0 h1:RPNrshWIDI6G2gRW9EHilWtl7Z6Sb1BR0xunSBf0SNc=
++github.com/kylelemons/godebug v1.1.0/go.mod h1:9/0rRGxNHcop5bhtWyNeEfOS8JIWk580+fNqagV/RAw=
++github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 h1:C3w9PqII01/Oq1c1nUAm88MOHcQC9l5mIlSMApZMrHA=
++github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822/go.mod h1:+n7T8mK8HuQTcFwEeznm/DIxMOiR9yIdICNftLE1DvQ=
+ github.com/nxadm/tail v1.4.8 h1:nPr65rt6Y5JFSKQO7qToXr7pePgD6Gwiw05lkbyAQTE=
+ github.com/nxadm/tail v1.4.8/go.mod h1:+ncqLTQzXmGhMZNUePPaPqPvBxHAIsmXswZKocGu+AU=
+ github.com/onsi/ginkgo v1.16.5 h1:8xi0RTUf59SOSfEtZMvwTvXYMzG4gV23XVHOZiXNtnE=
+ github.com/onsi/ginkgo v1.16.5/go.mod h1:+E8gABHa3K6zRBolWtd+ROzc/U5bkGt0FwiG042wbpU=
+ github.com/onsi/gomega v1.18.1 h1:M1GfJqGRrBrrGGsbxzV5dqM2U2ApXefZCQpkukxYRLE=
+ github.com/onsi/gomega v1.18.1/go.mod h1:0q+aL8jAiMXy9hbwj2mr5GziHiwhAIQpFmmtT5hitRs=
+-golang.org/x/net v0.0.0-20210428140749-89ef3d95e781 h1:DzZ89McO9/gWPsQXS/FVKAlG02ZjaQ6AlZRBimEYOd0=
+-golang.org/x/net v0.0.0-20210428140749-89ef3d95e781/go.mod h1:OJAsFXCWl8Ukc7SiCT/9KSuxbyM7479/AVlXFRxuMCk=
+-golang.org/x/sys v0.0.0-20211216021012-1d35b9e2eb4e h1:fLOSk5Q00efkSvAm+4xcoXD+RRmLmmulPn5I3Y9F2EM=
+-golang.org/x/sys v0.0.0-20211216021012-1d35b9e2eb4e/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+-golang.org/x/text v0.3.6 h1:aRYxNxv6iGQlyVaZmk6ZgYEDa+Jg18DxebPSrd6bg1M=
+-golang.org/x/text v0.3.6/go.mod h1:5Zoc/QRtKVWzQhOtBMvqHzDpF6irO9z98xDceosuGiQ=
++github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
++github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
++github.com/prometheus/client_golang v1.23.2 h1:Je96obch5RDVy3FDMndoUsjAhG5Edi49h0RJWRi/o0o=
++github.com/prometheus/client_golang v1.23.2/go.mod h1:Tb1a6LWHB3/SPIzCoaDXI4I8UHKeFTEQ1YCr+0Gyqmg=
++github.com/prometheus/client_model v0.6.2 h1:oBsgwpGs7iVziMvrGhE53c/GrLUsZdHnqNwqPLxwZyk=
++github.com/prometheus/client_model v0.6.2/go.mod h1:y3m2F6Gdpfy6Ut/GBsUqTWZqCUvMVzSfMLjcu6wAwpE=
++github.com/prometheus/common v0.66.1 h1:h5E0h5/Y8niHc5DlaLlWLArTQI7tMrsfQjHV+d9ZoGs=
++github.com/prometheus/common v0.66.1/go.mod h1:gcaUsgf3KfRSwHY4dIMXLPV0K/Wg1oZ8+SbZk/HH/dA=
++github.com/prometheus/procfs v0.16.1 h1:hZ15bTNuirocR6u0JZ6BAHHmwS1p8B4P6MRqxtzMyRg=
++github.com/prometheus/procfs v0.16.1/go.mod h1:teAbpZRB1iIAJYREa1LsoWUXykVXA1KlTmWl8x/U+Is=
++github.com/rogpeppe/go-internal v1.10.0 h1:TMyTOH3F/DB16zRVcYyreMH6GnZZrwQVAoYjRBZyWFQ=
++github.com/rogpeppe/go-internal v1.10.0/go.mod h1:UQnix2H7Ngw/k4C5ijL5+65zddjncjaFoBhdsK/akog=
++github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu7U=
++github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
++go.uber.org/goleak v1.3.0 h1:2K3zAYmnTNqV73imy9J1T3WC+gmCePx2hEGkimedGto=
++go.uber.org/goleak v1.3.0/go.mod h1:CoHD4mav9JJNrW/WLlf7HGZPjdw8EucARQHekz1X6bE=
++go.yaml.in/yaml/v2 v2.4.2 h1:DzmwEr2rDGHl7lsFgAHxmNz/1NlQ7xLIrlN2h5d1eGI=
++go.yaml.in/yaml/v2 v2.4.2/go.mod h1:081UH+NErpNdqlCXm3TtEran0rJZGxAYx9hb/ELlsPU=
++golang.org/x/net v0.43.0 h1:lat02VYK2j4aLzMzecihNvTlJNQUq316m2Mr9rnM6YE=
++golang.org/x/net v0.43.0/go.mod h1:vhO1fvI4dGsIjh73sWfUVjj3N7CA9WkKJNQm2svM6Jg=
++golang.org/x/sys v0.35.0 h1:vz1N37gP5bs89s7He8XuIYXpyY0+QlsKmzipCbUtyxI=
++golang.org/x/sys v0.35.0/go.mod h1:BJP2sWEmIv4KK5OTEluFJCKSidICx8ciO85XgH3Ak8k=
++golang.org/x/text v0.28.0 h1:rhazDwis8INMIwQ4tpjLDzUhx6RlXqZNPEM0huQojng=
++golang.org/x/text v0.28.0/go.mod h1:U8nCwOR8jO/marOQ0QbDiOngZVEBB7MAiitBuMjXiNU=
++google.golang.org/protobuf v1.36.8 h1:xHScyCOEuuwZEc6UtSOvPbAT4zRh0xcNRYekJwfqyMc=
++google.golang.org/protobuf v1.36.8/go.mod h1:fuxRtAxBytpl4zzqUh6/eyUujkJdNiuEkXntxiD/uRU=
++gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405/go.mod h1:Co6ibVJAznAaIkqp8huTwlJQCZ016jof/cbN4VW5Yz0=
++gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c h1:Hei/4ADfdWqJk1ZMxUNpqntNwaWcugrBjAiHlqqRiVk=
++gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c/go.mod h1:JHkPIbrfpd72SG/EVd6muEfDQjcINNoR0C8j2r3qZ4Q=
+ gopkg.in/tomb.v1 v1.0.0-20141024135613-dd632973f1e7 h1:uRGJdciOHaEIrze2W8Q3AKkepLTh2hOroT7a+7czfdQ=
+ gopkg.in/tomb.v1 v1.0.0-20141024135613-dd632973f1e7/go.mod h1:dt/ZhP58zS4L8KSrWDmTeBkI65Dw0HsyUHuEVlX15mw=
+ gopkg.in/yaml.v2 v2.4.0 h1:D8xgwECY7CYvx+Y2n4sBz93Jn9JRvxdiyyo8CTfuKaY=
+ gopkg.in/yaml.v2 v2.4.0/go.mod h1:RDklbk79AGWmwhnvt/jBztapEOGDOx6ZbXqjP6csGnQ=
++gopkg.in/yaml.v3 v3.0.1 h1:fxVm/GzAzEWqLHuvctI91KS9hhNmmWOoWu0XTYJS7CA=
++gopkg.in/yaml.v3 v3.0.1/go.mod h1:K4uyk7z7BCEPqu6E+C64Yfv1cQ7kz7rIZviUmN+EgEM=
+diff --git a/services/api-gateway/main.go b/services/api-gateway/main.go
+index e58a036..c8f999b 100644
+--- a/services/api-gateway/main.go
++++ b/services/api-gateway/main.go
+@@ -2,21 +2,31 @@ package main
+ 
+ import (
+ 	"context"
++	"crypto/sha256"
++	"encoding/hex"
+ 	"encoding/json"
++	"errors"
+ 	"fmt"
+ 	"log"
++	"log/slog"
++	"math"
++	"net"
+ 	"net/http"
+ 	"net/http/httputil"
+ 	"net/url"
+ 	"os"
+ 	"os/signal"
++	"strconv"
+ 	"strings"
+ 	"sync"
++	"sync/atomic"
+ 	"syscall"
+ 	"time"
+ 
+ 	"github.com/go-redis/redis/v8"
+ 	"github.com/golang-jwt/jwt/v5"
++	"github.com/prometheus/client_golang/prometheus"
++	"github.com/prometheus/client_golang/prometheus/promhttp"
+ )
+ 
+ var (
+@@ -24,11 +34,18 @@ var (
+ 	ctx         = context.Background()
+ 	jwtSecret   []byte
+ 	routes      map[string]string
++	rlConfig    rateLimitConfig
+ )
+ 
+ func main() {
+ 	jwtSecret = []byte(getEnv("JWT_SECRET", "change-me-in-production"))
+ 
++	var err error
++	rlConfig, err = loadRateLimitConfig()
++	if err != nil {
++		log.Fatalf("Invalid rate limit configuration: %v", err)
++	}
++
+ 	// Service routes - internal service URLs
+ 	routes = map[string]string{
+ 		"/api/orders":        getEnv("ORDER_SERVICE_URL", "http://order-service:8081"),
+@@ -39,22 +56,27 @@ func main() {
+ 		"/api/dashboard":     getEnv("DASHBOARD_SERVICE_URL", "http://dashboard-api:8086"),
+ 	}
+ 
+-	// Redis for rate limiting
+-	redisURL := os.Getenv("REDIS_URL")
+-	if redisURL != "" {
++	// Redis for rate limiting. The client is kept even if Redis is not reachable yet:
++	// go-redis reconnects on its own, and each request fails open until Redis is back.
++	// (Previously a failed startup ping disabled rate limiting until the next restart.)
++	if redisURL := os.Getenv("REDIS_URL"); redisURL != "" {
+ 		opt, err := redis.ParseURL(redisURL)
+ 		if err != nil {
+-			log.Printf("WARNING: invalid REDIS_URL, rate limiting disabled: %v", err)
++			log.Fatalf("Invalid REDIS_URL: %v", err)
++		}
++		redisClient = redis.NewClient(opt)
++		if _, err := redisClient.Ping(ctx).Result(); err != nil {
++			log.Printf("WARNING: Redis not reachable yet, rate limiting fails open until it is: %v", err)
+ 		} else {
+-			redisClient = redis.NewClient(opt)
+-			if _, err := redisClient.Ping(ctx).Result(); err != nil {
+-				log.Printf("WARNING: Redis not reachable, rate limiting disabled: %v", err)
+-				redisClient = nil
+-			} else {
+-				log.Println("Redis connected for rate limiting")
+-			}
++			log.Println("Redis connected for rate limiting")
+ 		}
++	} else {
++		log.Println("WARNING: REDIS_URL not set, rate limiting disabled")
+ 	}
++	log.Printf("Rate limits per %s: user=%d ip=%d sensitive=%d, trusted proxies=%d",
++		rlConfig.window, rlConfig.userLimit, rlConfig.ipLimit, rlConfig.sensitiveLimit, len(rlConfig.trustedProxies))
++
++	startMetricsServer(getEnv("METRICS_PORT", "9090"))
+ 
+ 	mux := http.NewServeMux()
+ 	mux.HandleFunc("/livez", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
+@@ -90,6 +112,10 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
+ 		httpError(w, "method not allowed", http.StatusMethodNotAllowed)
+ 		return
+ 	}
++	// Login is a brute-force target: stricter per-IP limit, applied before any work.
++	if rateLimited(w, r, scopeSensitive, clientIP(r), rlConfig.sensitiveLimit) {
++		return
++	}
+ 
+ 	var req struct {
+ 		Email    string `json:"email"`
+@@ -103,10 +129,10 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
+ 	// In production this would validate against a user database
+ 	// For this project, accept any email/password and return a JWT
+ 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+-		"sub":   req.Email,
+-		"role":  "customer",
+-		"exp":   time.Now().Add(24 * time.Hour).Unix(),
+-		"iat":   time.Now().Unix(),
++		"sub":  req.Email,
++		"role": "customer",
++		"exp":  time.Now().Add(24 * time.Hour).Unix(),
++		"iat":  time.Now().Unix(),
+ 	})
+ 
+ 	tokenString, err := token.SignedString(jwtSecret)
+@@ -124,6 +150,9 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
+ 		httpError(w, "method not allowed", http.StatusMethodNotAllowed)
+ 		return
+ 	}
++	if rateLimited(w, r, scopeSensitive, clientIP(r), rlConfig.sensitiveLimit) {
++		return
++	}
+ 
+ 	var req struct {
+ 		Email    string `json:"email"`
+@@ -165,30 +194,33 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
+ }
+ 
+ func handleProxy(w http.ResponseWriter, r *http.Request) {
+-	// Rate limiting
+-	if redisClient != nil {
+-		ip := clientIP(r)
+-		key := fmt.Sprintf("rate:%s", ip)
+-		count, _ := redisClient.Incr(ctx, key).Result()
+-		if count == 1 {
+-			redisClient.Expire(ctx, key, time.Minute)
++	if isPublicPath(r.URL.Path) {
++		// Anonymous traffic is limited per client IP; sensitive routes (webhook) more strictly.
++		scope, limit := scopeIP, rlConfig.ipLimit
++		if isSensitivePath(r.URL.Path) {
++			scope, limit = scopeSensitive, rlConfig.sensitiveLimit
+ 		}
+-		limit := 100 // requests per minute
+-		if count > int64(limit) {
+-			httpError(w, "rate limit exceeded", http.StatusTooManyRequests)
++		if rateLimited(w, r, scope, clientIP(r), limit) {
+ 			return
+ 		}
+-	}
+-
+-	// Auth check (skip for public endpoints)
+-	if !isPublicPath(r.URL.Path) {
++	} else {
+ 		claims, err := validateToken(r)
+ 		if err != nil {
+ 			httpError(w, "unauthorized: "+err.Error(), http.StatusUnauthorized)
+ 			return
+ 		}
++		// Logged-in shoppers are limited per user, so many shoppers behind one
++		// IP (mobile carrier, office NAT) don't share a single budget.
++		sub, _ := claims["sub"].(string)
++		id := sub
++		if id == "" {
++			id = "ip:" + clientIP(r) // token without a subject: fall back to the IP
++		}
++		if rateLimited(w, r, scopeUser, id, rlConfig.userLimit) {
++			return
++		}
+ 		// Forward user info to downstream services
+-		if sub, ok := claims["sub"].(string); ok {
++		if sub != "" {
+ 			r.Header.Set("X-User-Email", sub)
+ 		}
+ 		if role, ok := claims["role"].(string); ok {
+@@ -241,6 +273,12 @@ func isPublicPath(path string) bool {
+ 	return false
+ }
+ 
++// isSensitivePath marks anonymous routes that attackers target (credential
++// stuffing, account creation, forged carrier callbacks). They get the stricter limit.
++func isSensitivePath(path string) bool {
++	return strings.HasPrefix(path, "/auth/") || strings.HasPrefix(path, "/api/shipping/webhook")
++}
++
+ func validateToken(r *http.Request) (jwt.MapClaims, error) {
+ 	auth := r.Header.Get("Authorization")
+ 	if auth == "" {
+@@ -281,17 +319,254 @@ func getEnv(key, fallback string) string {
+ 	return fallback
+ }
+ 
++// ---------------------------------------------------------------------------
++// Rate limiting
++//
++// Interim design (decided 24 Sep, revisit at the hardening pass): all limiting
++// lives in this gateway. Fixed window per key, counted atomically in Redis.
++// Fails open if Redis is unavailable, with throttled structured logs and metrics.
++// Later option once Traefik runs on EKS: per-IP limits at the edge (Traefik
++// RateLimit with Redis), per-user limits stay here because only the gateway
++// knows the user.
++// ---------------------------------------------------------------------------
++
++const (
++	scopeUser      = "user"      // authenticated traffic, keyed by JWT subject
++	scopeIP        = "ip"        // anonymous traffic, keyed by client IP
++	scopeSensitive = "sensitive" // login/register/webhook, keyed by client IP, stricter
++)
++
++// Each Redis call gets a short deadline so a slow Redis cannot stall requests;
++// on timeout the request fails open.
++const redisTimeout = 100 * time.Millisecond
++
++type rateLimitConfig struct {
++	window         time.Duration
++	userLimit      int64
++	ipLimit        int64
++	sensitiveLimit int64
++	trustedProxies []*net.IPNet
++}
++
++// loadRateLimitConfig reads limits and trusted proxies from the environment.
++// Defaults are starting points to tune from load-test results, not measured values.
++func loadRateLimitConfig() (rateLimitConfig, error) {
++	var cfg rateLimitConfig
++	windowSecs, err := envInt("RATE_LIMIT_WINDOW_SECONDS", 60)
++	if err != nil {
++		return cfg, err
++	}
++	cfg.window = time.Duration(windowSecs) * time.Second
++	if cfg.userLimit, err = envInt("RATE_LIMIT_USER_PER_WINDOW", 120); err != nil {
++		return cfg, err
++	}
++	if cfg.ipLimit, err = envInt("RATE_LIMIT_IP_PER_WINDOW", 60); err != nil {
++		return cfg, err
++	}
++	if cfg.sensitiveLimit, err = envInt("RATE_LIMIT_SENSITIVE_PER_WINDOW", 20); err != nil {
++		return cfg, err
++	}
++	cfg.trustedProxies, err = parseTrustedProxies(os.Getenv("TRUSTED_PROXY_CIDRS"))
++	return cfg, err
++}
++
++func envInt(key string, fallback int64) (int64, error) {
++	v := os.Getenv(key)
++	if v == "" {
++		return fallback, nil
++	}
++	n, err := strconv.ParseInt(v, 10, 64)
++	if err != nil || n <= 0 {
++		return 0, fmt.Errorf("%s must be a positive integer, got %q", key, v)
++	}
++	return n, nil
++}
++
++// parseTrustedProxies accepts a comma-separated list of CIDRs or single IPs,
++// e.g. "10.0.0.0/16,192.168.1.10". Empty means no proxy is trusted.
++func parseTrustedProxies(s string) ([]*net.IPNet, error) {
++	var nets []*net.IPNet
++	for _, part := range strings.Split(s, ",") {
++		part = strings.TrimSpace(part)
++		if part == "" {
++			continue
++		}
++		if !strings.Contains(part, "/") {
++			if ip := net.ParseIP(part); ip != nil && ip.To4() != nil {
++				part += "/32"
++			} else {
++				part += "/128"
++			}
++		}
++		_, n, err := net.ParseCIDR(part)
++		if err != nil {
++			return nil, fmt.Errorf("TRUSTED_PROXY_CIDRS: invalid entry %q: %w", part, err)
++		}
++		nets = append(nets, n)
++	}
++	return nets, nil
++}
++
++func isTrustedProxy(ip net.IP) bool {
++	for _, n := range rlConfig.trustedProxies {
++		if n.Contains(ip) {
++			return true
++		}
++	}
++	return false
++}
++
++// clientIP returns the caller's IP without the port.
++// Forwarding headers are only believed when the direct peer is a trusted proxy;
++// otherwise any client could claim any IP. With a trusted proxy, X-Forwarded-For
++// is read right to left (the right end is written by our own proxies) and the
++// first address that is not a trusted proxy is the real client.
+ func clientIP(r *http.Request) string {
+-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+-		if idx := strings.Index(xff, ","); idx >= 0 {
+-			return strings.TrimSpace(xff[:idx])
++	remote := r.RemoteAddr
++	if host, _, err := net.SplitHostPort(remote); err == nil {
++		remote = host
++	}
++	remoteIP := net.ParseIP(remote)
++	if remoteIP == nil || !isTrustedProxy(remoteIP) {
++		return remote
++	}
++
++	if xff := strings.Join(r.Header.Values("X-Forwarded-For"), ","); xff != "" {
++		parts := strings.Split(xff, ",")
++		for i := len(parts) - 1; i >= 0; i-- {
++			ip := net.ParseIP(strings.TrimSpace(parts[i]))
++			if ip == nil {
++				return remote // malformed chain: don't guess
++			}
++			if !isTrustedProxy(ip) {
++				return ip.String()
++			}
++		}
++	}
++	if ip := net.ParseIP(strings.TrimSpace(r.Header.Get("X-Real-IP"))); ip != nil {
++		return ip.String()
++	}
++	return remote
++}
++
++// rateLimitScript increments the counter and sets its expiry in one atomic step.
++// It also repairs keys that somehow have no expiry (PTTL = -1), so no client can
++// be blocked forever. Returns {count, milliseconds until the window resets}.
++var rateLimitScript = redis.NewScript(`
++local count = redis.call('INCR', KEYS[1])
++local ttl = redis.call('PTTL', KEYS[1])
++if ttl < 0 then
++  redis.call('PEXPIRE', KEYS[1], ARGV[1])
++  ttl = tonumber(ARGV[1])
++end
++return {count, ttl}
++`)
++
++var errLimiterDisabled = errors.New("rate limiter disabled: REDIS_URL not set")
++
++// allowRequest counts one request for (scope, id) and reports whether it is within limit.
++func allowRequest(c context.Context, scope, id string, limit int64) (bool, time.Duration, error) {
++	if redisClient == nil {
++		return true, 0, errLimiterDisabled
++	}
++	key := "rl:" + scope + ":" + hashID(id)
++	res, err := rateLimitScript.Run(c, redisClient, []string{key}, rlConfig.window.Milliseconds()).Slice()
++	if err != nil {
++		return true, 0, err
++	}
++	if len(res) != 2 {
++		return true, 0, fmt.Errorf("unexpected rate limit script result: %v", res)
++	}
++	count, _ := res[0].(int64)
++	ttlMs, _ := res[1].(int64)
++	if count > limit {
++		return false, time.Duration(ttlMs) * time.Millisecond, nil
++	}
++	return true, 0, nil
++}
++
++// rateLimited applies the limit and writes a 429 with Retry-After when blocked.
++// It returns true when the request was blocked and the caller must stop.
++func rateLimited(w http.ResponseWriter, r *http.Request, scope, id string, limit int64) bool {
++	c, cancel := context.WithTimeout(r.Context(), redisTimeout)
++	defer cancel()
++
++	allowed, retryAfter, err := allowRequest(c, scope, id, limit)
++	switch {
++	case errors.Is(err, errLimiterDisabled):
++		rateLimitDecisions.WithLabelValues(scope, "disabled").Inc()
++		return false
++	case err != nil:
++		rateLimitDecisions.WithLabelValues(scope, "redis_error").Inc()
++		logLimiterFailure(scope, err)
++		return false // fail open: keep the shop working
++	case !allowed:
++		rateLimitDecisions.WithLabelValues(scope, "limited").Inc()
++		secs := int(math.Ceil(retryAfter.Seconds()))
++		if secs < 1 {
++			secs = 1
+ 		}
+-		return strings.TrimSpace(xff)
++		w.Header().Set("Retry-After", strconv.Itoa(secs))
++		limiterLog.Warn("rate limit exceeded",
++			"scope", scope, "key", hashID(id), "limit", limit,
++			"window_s", int(rlConfig.window.Seconds()), "retry_after_s", secs, "path", r.URL.Path)
++		httpError(w, "rate limit exceeded", http.StatusTooManyRequests)
++		return true
++	default:
++		rateLimitDecisions.WithLabelValues(scope, "allowed").Inc()
++		return false
+ 	}
+-	if xrip := r.Header.Get("X-Real-IP"); xrip != "" {
+-		return xrip
++}
++
++// hashID keeps emails and IPs out of Redis keys and logs (GDPR-style data minimisation).
++func hashID(id string) string {
++	sum := sha256.Sum256([]byte(id))
++	return hex.EncodeToString(sum[:16])
++}
++
++// limiterLog emits JSON lines so rate-limit events are easy to query in a log backend.
++var limiterLog = slog.New(slog.NewJSONHandler(os.Stderr, nil))
++
++// logLimiterFailure logs Redis failures at most once per 10 s, with a count of
++// suppressed failures, so an outage doesn't flood the logs at peak traffic.
++var (
++	lastLimiterErrLog     atomic.Int64
++	suppressedLimiterErrs atomic.Int64
++)
++
++func logLimiterFailure(scope string, err error) {
++	now := time.Now().Unix()
++	last := lastLimiterErrLog.Load()
++	if now-last < 10 || !lastLimiterErrLog.CompareAndSwap(last, now) {
++		suppressedLimiterErrs.Add(1)
++		return
+ 	}
+-	return r.RemoteAddr
++	limiterLog.Error("rate limiter unavailable, failing open",
++		"scope", scope, "error", err.Error(), "suppressed_since_last_log", suppressedLimiterErrs.Swap(0))
++}
++
++// rateLimitDecisions counts every limiter decision. Alert on result="redis_error"
++// (protection is off) and watch result="limited" per scope.
++var rateLimitDecisions = prometheus.NewCounterVec(prometheus.CounterOpts{
++	Name: "gateway_rate_limit_decisions_total",
++	Help: "Rate limit decisions by scope (user, ip, sensitive) and result (allowed, limited, redis_error, disabled).",
++}, []string{"scope", "result"})
++
++func init() {
++	prometheus.MustRegister(rateLimitDecisions)
++}
++
++// startMetricsServer serves Prometheus metrics on a separate port that the
++// gateway never routes to, so /metrics is not reachable from the internet.
++func startMetricsServer(port string) {
++	mux := http.NewServeMux()
++	mux.Handle("/metrics", promhttp.Handler())
++	go func() {
++		log.Printf("Metrics listening on :%s", port)
++		if err := http.ListenAndServe(":"+port, mux); err != nil {
++			log.Printf("metrics server error: %v", err)
++		}
++	}()
+ }
+ 
+ var shutdownOnce sync.Once
+@@ -307,5 +582,3 @@ func gracefulShutdown(server *http.Server) {
+ 		server.Shutdown(ctx)
+ 	})
+ }
+-
+-
+diff --git a/services/inventory-service/go.mod b/services/inventory-service/go.mod
+index fb3319e..f1c984e 100644
+--- a/services/inventory-service/go.mod
++++ b/services/inventory-service/go.mod
+@@ -1,5 +1,19 @@
+ module github.com/CoderCo-Learning/ecs-v3/services/inventory-service
+ 
+-go 1.22
++go 1.23.0
+ 
+ require github.com/lib/pq v1.10.9
++
++require (
++	github.com/beorn7/perks v1.0.1 // indirect
++	github.com/cespare/xxhash/v2 v2.3.0 // indirect
++	github.com/kr/text v0.2.0 // indirect
++	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
++	github.com/prometheus/client_golang v1.23.2
++	github.com/prometheus/client_model v0.6.2 // indirect
++	github.com/prometheus/common v0.66.1 // indirect
++	github.com/prometheus/procfs v0.16.1 // indirect
++	go.yaml.in/yaml/v2 v2.4.2 // indirect
++	golang.org/x/sys v0.35.0 // indirect
++	google.golang.org/protobuf v1.36.8 // indirect
++)
+diff --git a/services/inventory-service/go.sum b/services/inventory-service/go.sum
+index aeddeae..bbfa42c 100644
+--- a/services/inventory-service/go.sum
++++ b/services/inventory-service/go.sum
+@@ -1,2 +1,48 @@
++github.com/beorn7/perks v1.0.1 h1:VlbKKnNfV8bJzeqoa4cOKqO6bYr3WgKZxO8Z16+hsOM=
++github.com/beorn7/perks v1.0.1/go.mod h1:G2ZrVWU2WbWT9wwq4/hrbKbnv/1ERSJQ0ibhJ6rlkpw=
++github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=
++github.com/cespare/xxhash/v2 v2.3.0/go.mod h1:VGX0DQ3Q6kWi7AoAeZDth3/j3BFtOZR5XLFGgcrjCOs=
++github.com/creack/pty v1.1.9/go.mod h1:oKZEueFk5CKHvIhNR5MUki03XCEU+Q6VDXinZuGJ33E=
++github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
++github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
++github.com/google/go-cmp v0.7.0 h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=
++github.com/google/go-cmp v0.7.0/go.mod h1:pXiqmnSA92OHEEa9HXL2W4E7lf9JzCmGVUdgjX3N/iU=
++github.com/klauspost/compress v1.18.0 h1:c/Cqfb0r+Yi+JtIEq73FWXVkRonBlf0CRNYc8Zttxdo=
++github.com/klauspost/compress v1.18.0/go.mod h1:2Pp+KzxcywXVXMr50+X0Q/Lsb43OQHYWRCY2AiWywWQ=
++github.com/kr/pretty v0.3.1 h1:flRD4NNwYAUpkphVc1HcthR4KEIFJ65n8Mw5qdRn3LE=
++github.com/kr/pretty v0.3.1/go.mod h1:hoEshYVHaxMs3cyo3Yncou5ZscifuDolrwPKZanG3xk=
++github.com/kr/text v0.2.0 h1:5Nx0Ya0ZqY2ygV366QzturHI13Jq95ApcVaJBhpS+AY=
++github.com/kr/text v0.2.0/go.mod h1:eLer722TekiGuMkidMxC/pM04lWEeraHUUmBw8l2grE=
++github.com/kylelemons/godebug v1.1.0 h1:RPNrshWIDI6G2gRW9EHilWtl7Z6Sb1BR0xunSBf0SNc=
++github.com/kylelemons/godebug v1.1.0/go.mod h1:9/0rRGxNHcop5bhtWyNeEfOS8JIWk580+fNqagV/RAw=
+ github.com/lib/pq v1.10.9 h1:YXG7RB+JIjhP29X+OtkiDnYaXQwpS4JEWq7dtCCRUEw=
+ github.com/lib/pq v1.10.9/go.mod h1:AlVN5x4E4T544tWzH6hKfbfQvm3HdbOxrmggDNAPY9o=
++github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 h1:C3w9PqII01/Oq1c1nUAm88MOHcQC9l5mIlSMApZMrHA=
++github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822/go.mod h1:+n7T8mK8HuQTcFwEeznm/DIxMOiR9yIdICNftLE1DvQ=
++github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
++github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
++github.com/prometheus/client_golang v1.23.2 h1:Je96obch5RDVy3FDMndoUsjAhG5Edi49h0RJWRi/o0o=
++github.com/prometheus/client_golang v1.23.2/go.mod h1:Tb1a6LWHB3/SPIzCoaDXI4I8UHKeFTEQ1YCr+0Gyqmg=
++github.com/prometheus/client_model v0.6.2 h1:oBsgwpGs7iVziMvrGhE53c/GrLUsZdHnqNwqPLxwZyk=
++github.com/prometheus/client_model v0.6.2/go.mod h1:y3m2F6Gdpfy6Ut/GBsUqTWZqCUvMVzSfMLjcu6wAwpE=
++github.com/prometheus/common v0.66.1 h1:h5E0h5/Y8niHc5DlaLlWLArTQI7tMrsfQjHV+d9ZoGs=
++github.com/prometheus/common v0.66.1/go.mod h1:gcaUsgf3KfRSwHY4dIMXLPV0K/Wg1oZ8+SbZk/HH/dA=
++github.com/prometheus/procfs v0.16.1 h1:hZ15bTNuirocR6u0JZ6BAHHmwS1p8B4P6MRqxtzMyRg=
++github.com/prometheus/procfs v0.16.1/go.mod h1:teAbpZRB1iIAJYREa1LsoWUXykVXA1KlTmWl8x/U+Is=
++github.com/rogpeppe/go-internal v1.10.0 h1:TMyTOH3F/DB16zRVcYyreMH6GnZZrwQVAoYjRBZyWFQ=
++github.com/rogpeppe/go-internal v1.10.0/go.mod h1:UQnix2H7Ngw/k4C5ijL5+65zddjncjaFoBhdsK/akog=
++github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu7U=
++github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
++go.uber.org/goleak v1.3.0 h1:2K3zAYmnTNqV73imy9J1T3WC+gmCePx2hEGkimedGto=
++go.uber.org/goleak v1.3.0/go.mod h1:CoHD4mav9JJNrW/WLlf7HGZPjdw8EucARQHekz1X6bE=
++go.yaml.in/yaml/v2 v2.4.2 h1:DzmwEr2rDGHl7lsFgAHxmNz/1NlQ7xLIrlN2h5d1eGI=
++go.yaml.in/yaml/v2 v2.4.2/go.mod h1:081UH+NErpNdqlCXm3TtEran0rJZGxAYx9hb/ELlsPU=
++golang.org/x/sys v0.35.0 h1:vz1N37gP5bs89s7He8XuIYXpyY0+QlsKmzipCbUtyxI=
++golang.org/x/sys v0.35.0/go.mod h1:BJP2sWEmIv4KK5OTEluFJCKSidICx8ciO85XgH3Ak8k=
++google.golang.org/protobuf v1.36.8 h1:xHScyCOEuuwZEc6UtSOvPbAT4zRh0xcNRYekJwfqyMc=
++google.golang.org/protobuf v1.36.8/go.mod h1:fuxRtAxBytpl4zzqUh6/eyUujkJdNiuEkXntxiD/uRU=
++gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405/go.mod h1:Co6ibVJAznAaIkqp8huTwlJQCZ016jof/cbN4VW5Yz0=
++gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c h1:Hei/4ADfdWqJk1ZMxUNpqntNwaWcugrBjAiHlqqRiVk=
++gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c/go.mod h1:JHkPIbrfpd72SG/EVd6muEfDQjcINNoR0C8j2r3qZ4Q=
++gopkg.in/yaml.v3 v3.0.1 h1:fxVm/GzAzEWqLHuvctI91KS9hhNmmWOoWu0XTYJS7CA=
++gopkg.in/yaml.v3 v3.0.1/go.mod h1:K4uyk7z7BCEPqu6E+C64Yfv1cQ7kz7rIZviUmN+EgEM=
+diff --git a/services/inventory-service/main.go b/services/inventory-service/main.go
+index 298036a..3153809 100644
+--- a/services/inventory-service/main.go
++++ b/services/inventory-service/main.go
+@@ -58,6 +58,7 @@ func main() {
+ 	db.SetConnMaxLifetime(5 * time.Minute)
+ 	waitForDB()
+ 	migrate()
++	startMetricsServer(db, getEnv("METRICS_PORT", "9090"))
+ 
+ 	mux := http.NewServeMux()
+ 	mux.HandleFunc("/livez", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
+diff --git a/services/order-service/go.mod b/services/order-service/go.mod
+index 7a77be2..78f2eeb 100644
+--- a/services/order-service/go.mod
++++ b/services/order-service/go.mod
+@@ -1,5 +1,25 @@
+ module github.com/CoderCo-Learning/ecs-v3/services/order-service
+ 
+-go 1.22
++go 1.24
+ 
+-require github.com/lib/pq v1.10.9
++require (
++	github.com/aws/aws-sdk-go-v2 v1.47.0
++	github.com/aws/aws-sdk-go-v2/config v1.33.5
++	github.com/aws/aws-sdk-go-v2/service/sqs v1.52.0
++	github.com/lib/pq v1.10.9
++)
++
++require (
++	github.com/aws/aws-sdk-go-v2/credentials v1.20.5 // indirect
++	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.20.0 // indirect
++	github.com/aws/aws-sdk-go-v2/internal/configsources v1.5.3 // indirect
++	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.8.3 // indirect
++	github.com/aws/aws-sdk-go-v2/internal/v4a v1.5.3 // indirect
++	github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding v1.13.19 // indirect
++	github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.14.3 // indirect
++	github.com/aws/aws-sdk-go-v2/service/signin v1.10.0 // indirect
++	github.com/aws/aws-sdk-go-v2/service/sso v1.38.0 // indirect
++	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.43.0 // indirect
++	github.com/aws/aws-sdk-go-v2/service/sts v1.51.0 // indirect
++	github.com/aws/smithy-go v1.28.1 // indirect
++)
+diff --git a/services/order-service/go.sum b/services/order-service/go.sum
+index aeddeae..c006432 100644
+--- a/services/order-service/go.sum
++++ b/services/order-service/go.sum
+@@ -1,2 +1,32 @@
++github.com/aws/aws-sdk-go-v2 v1.47.0 h1:0jsHallhJCeaU0Ko48c/3FK1ctOQ7NpzggxriJOQ8MQ=
++github.com/aws/aws-sdk-go-v2 v1.47.0/go.mod h1:bttEH6JqnUL8LepvDVfdrds/fZ5bCIxzpe3abyUrhDU=
++github.com/aws/aws-sdk-go-v2/config v1.33.5 h1:UA1dmokBFOLFoOyVBhO6HjM6edy0MIk5AZSkJVcksQw=
++github.com/aws/aws-sdk-go-v2/config v1.33.5/go.mod h1:Dop8axzz0xx38GExIYWXdeyc8QQ7Cr+nPsxpD/LYy4U=
++github.com/aws/aws-sdk-go-v2/credentials v1.20.5 h1:wklUVvHMc9xTQ3rcp49/ISpiMnhbCicJcA6n6S8m7J8=
++github.com/aws/aws-sdk-go-v2/credentials v1.20.5/go.mod h1:fyEdrn6ccLFOkoK84j5bQyGTxp9zPt5l2XMhxf4DVZs=
++github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.20.0 h1:AM4hHjww+PSFtt6E+UrBrPlZkWsePCLEt9AjkfQX+yM=
++github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.20.0/go.mod h1:3x/yXezeQjpOvBb4jEMxrS8SXvpdvJ5abv6l5c1gWM8=
++github.com/aws/aws-sdk-go-v2/internal/configsources v1.5.3 h1:Hp/VgjP0BysR3OgLlR057Vz2LcbbVnoWeJ+3qWiS/fY=
++github.com/aws/aws-sdk-go-v2/internal/configsources v1.5.3/go.mod h1:nwGV5qw7F1IZPgxCvA/ph8N2TAuz+BkRG/bXn808qMA=
++github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.8.3 h1:MUaM4f+kj1ZIBPZfUS8cxP1GKXXZtHJjAthy93AN7SM=
++github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.8.3/go.mod h1:6YmVmEVRI5ZZzRjCSsb9SryKH0hAlMRdgA7kG9aDvBU=
++github.com/aws/aws-sdk-go-v2/internal/v4a v1.5.3 h1:fuSCw4Z2qfRCztMPO3GXJNSiEp6Wee+WOLwrHHUMy9c=
++github.com/aws/aws-sdk-go-v2/internal/v4a v1.5.3/go.mod h1:6SxcHheD1pPR5+kWm1wGvjlL/YqUsh267sAfEmN4K7A=
++github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding v1.13.19 h1:bAdDl/HkGCcGPoe25ToSHEw23VIxt6CT5fLcg111BKg=
++github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding v1.13.19/go.mod h1:KaUzbLxv4CeSxh6ZCl9B4m7CuFenS8kUEaDs+f/DQr4=
++github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.14.3 h1:bON1rJf67TSTDCKg816AAIE4xSTtoo9tl0XRkO72R+I=
++github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.14.3/go.mod h1:c5BBpjJcQXpfeq9iASyVKA3T6vX6B6LEXY4mL/gklDY=
++github.com/aws/aws-sdk-go-v2/service/signin v1.10.0 h1:ZD5qFpWcaOKdTuhBi431pIDkCgrMkMlMT6jlpSPoIRI=
++github.com/aws/aws-sdk-go-v2/service/signin v1.10.0/go.mod h1:8Nuuf+tR346PjJ3MvZPh9pekbLiLQFWJhzMXfwy7alA=
++github.com/aws/aws-sdk-go-v2/service/sqs v1.52.0 h1:39EpbrAPFSOPYc9FVr2ki84cLB/9C5nC03aL7ope2rU=
++github.com/aws/aws-sdk-go-v2/service/sqs v1.52.0/go.mod h1:yErwLsJkArgQLSGWtLjjwlpvlLK4+c9h0jDZZVN02hw=
++github.com/aws/aws-sdk-go-v2/service/sso v1.38.0 h1:JGeeBcMlhg1xtOXYpeCaTQBZObtXMPQCUqBcmr65NRA=
++github.com/aws/aws-sdk-go-v2/service/sso v1.38.0/go.mod h1:XwteswG9EOMRFm73UT0t+MbTwyLxMrEXkU6e+v92Lzo=
++github.com/aws/aws-sdk-go-v2/service/ssooidc v1.43.0 h1:obhahQXDEdVEv8y5bTKXR30LVaxYe1kyYM0L7l2Iq+k=
++github.com/aws/aws-sdk-go-v2/service/ssooidc v1.43.0/go.mod h1:6twZZ/aXHNy1vXUO8koUbp++MYzMASkOgEBdkbJYmO0=
++github.com/aws/aws-sdk-go-v2/service/sts v1.51.0 h1:Zpnqa6XtrNzXZnwbdCqHOXpXhMsa01ql/pcRQ1sb4hk=
++github.com/aws/aws-sdk-go-v2/service/sts v1.51.0/go.mod h1:/8JRcdTt//hG0Q4BTmGbuOplT7ABe+5rdtqUHqXvYIM=
++github.com/aws/smithy-go v1.28.1 h1:R/nXH00c8qcfCzQVELtRw+eLQWtzv+VAIEFJ1/xxXlQ=
++github.com/aws/smithy-go v1.28.1/go.mod h1:YE2RhdIuDbA5E5bTdciG9KrW3+TiEONeUWCqxX9i1Fc=
+ github.com/lib/pq v1.10.9 h1:YXG7RB+JIjhP29X+OtkiDnYaXQwpS4JEWq7dtCCRUEw=
+ github.com/lib/pq v1.10.9/go.mod h1:AlVN5x4E4T544tWzH6hKfbfQvm3HdbOxrmggDNAPY9o=
+diff --git a/services/order-service/main.go b/services/order-service/main.go
+index 9018d8e..6beafda 100644
+--- a/services/order-service/main.go
++++ b/services/order-service/main.go
+@@ -72,6 +72,25 @@ func main() {
+ 	waitForDB()
+ 	migrate()
+ 
++	// Outbox relay: delivers events saved in order_outbox to SQS in the background.
++	// Without SQS_QUEUE_URL, events are still saved and wait until a queue is configured.
++	relayCtx, stopRelay := context.WithCancel(context.Background())
++	relayDone := make(chan struct{})
++	if queueURL := os.Getenv("SQS_QUEUE_URL"); queueURL != "" {
++		pub, err := newSQSPublisher(relayCtx, queueURL)
++		if err != nil {
++			log.Fatalf("SQS publisher setup failed: %v", err)
++		}
++		go func() {
++			defer close(relayDone)
++			runOutboxRelay(relayCtx, pub, time.Second)
++		}()
++		log.Printf("Outbox relay started, publishing to %s", queueURL)
++	} else {
++		close(relayDone)
++		log.Println("WARNING: SQS_QUEUE_URL not set; events are stored in order_outbox but not delivered")
++	}
++
+ 	mux := http.NewServeMux()
+ 	mux.HandleFunc("/livez", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
+ 	mux.HandleFunc("/healthz", handleHealth)
+@@ -104,6 +123,14 @@ func main() {
+ 	if err := server.Shutdown(shutdownCtx); err != nil {
+ 		log.Printf("graceful shutdown error: %v", err)
+ 	}
++
++	// Stop the relay after HTTP traffic has drained, and let its current batch finish.
++	stopRelay()
++	select {
++	case <-relayDone:
++	case <-shutdownCtx.Done():
++		log.Println("outbox relay did not stop before shutdown timeout")
++	}
+ }
+ 
+ func migrate() {
+@@ -131,6 +158,19 @@ func migrate() {
+ 			created_at TIMESTAMP DEFAULT NOW()
+ 		)`,
+ 		`CREATE INDEX IF NOT EXISTS idx_order_events_order ON order_events(order_id)`,
++		// Transactional outbox (see outbox.go). Named order_outbox, not outbox, because all
++		// services share one database and each producer will own its own outbox table.
++		// TIMESTAMPTZ avoids the timezone bug found in the scheduler's TIMESTAMP columns.
++		`CREATE TABLE IF NOT EXISTS order_outbox (
++			id BIGSERIAL PRIMARY KEY,
++			event_type VARCHAR(100) NOT NULL,
++			payload JSONB NOT NULL,
++			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
++			sent_at TIMESTAMPTZ,
++			attempts INTEGER NOT NULL DEFAULT 0,
++			last_error TEXT
++		)`,
++		`CREATE INDEX IF NOT EXISTS idx_order_outbox_unsent ON order_outbox(id) WHERE sent_at IS NULL`,
+ 	}
+ 	for _, m := range migrations {
+ 		if _, err := db.Exec(m); err != nil {
+@@ -199,13 +239,22 @@ func createOrder(w http.ResponseWriter, r *http.Request) {
+ 
+ 	itemsJSON, _ := json.Marshal(req.Items)
+ 
++	// One transaction: the order, its history row and its outbox event are saved
++	// together or not at all. The event is delivered to SQS later by the outbox relay.
++	tx, err := db.Begin()
++	if err != nil {
++		log.Printf("Create order error: begin: %v", err)
++		httpError(w, "failed to create order", http.StatusInternalServerError)
++		return
++	}
++	defer tx.Rollback()
++
+ 	var orderID int
+-	err := db.QueryRow(
++	err = tx.QueryRow(
+ 		`INSERT INTO orders (customer_id, status, items, total, currency, notes)
+ 		 VALUES ($1, 'pending', $2, $3, $4, $5) RETURNING id`,
+ 		customerID, itemsJSON, total, currency, req.Notes,
+ 	).Scan(&orderID)
+-
+ 	if err != nil {
+ 		log.Printf("Create order error: %v", err)
+ 		httpError(w, "failed to create order", http.StatusInternalServerError)
+@@ -213,20 +262,34 @@ func createOrder(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 
+ 	// Record event
+-	db.Exec(
++	if _, err := tx.Exec(
+ 		`INSERT INTO order_events (order_id, event_type, new_status)
+ 		 VALUES ($1, 'order_created', 'pending')`,
+ 		orderID,
+-	)
++	); err != nil {
++		log.Printf("Create order error: order_events: %v", err)
++		httpError(w, "failed to create order", http.StatusInternalServerError)
++		return
++	}
+ 
+-	// Publish to SQS for downstream services (inventory reservation, etc.)
+-	publishEvent("order.created", map[string]interface{}{
++	// Queue order.created for downstream services (inventory reservation, etc.)
++	if err := enqueueEvent(tx, "order.created", map[string]interface{}{
+ 		"order_id":    orderID,
+ 		"customer_id": customerID,
+ 		"items":       req.Items,
+ 		"total":       total,
+ 		"currency":    currency,
+-	})
++	}); err != nil {
++		log.Printf("Create order error: %v", err)
++		httpError(w, "failed to create order", http.StatusInternalServerError)
++		return
++	}
++
++	if err := tx.Commit(); err != nil {
++		log.Printf("Create order error: commit: %v", err)
++		httpError(w, "failed to create order", http.StatusInternalServerError)
++		return
++	}
+ 
+ 	w.Header().Set("Content-Type", "application/json")
+ 	w.WriteHeader(http.StatusCreated)
+@@ -340,28 +403,49 @@ func handleUpdateStatus(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
+-	_, err = db.Exec(
++	// One transaction: status change, history row and outbox event are saved together.
++	// NOTE: the read-validate-update race (two concurrent transitions both accepted) is
++	// NOT fixed here; that is the next slice (compare-and-set on the UPDATE).
++	tx, err := db.Begin()
++	if err != nil {
++		httpError(w, "failed to update order", http.StatusInternalServerError)
++		return
++	}
++	defer tx.Rollback()
++
++	if _, err := tx.Exec(
+ 		"UPDATE orders SET status = $1, updated_at = NOW() WHERE id = $2",
+ 		req.NewStatus, req.OrderID,
+-	)
+-	if err != nil {
++	); err != nil {
+ 		httpError(w, "failed to update order", http.StatusInternalServerError)
+ 		return
+ 	}
+ 
+ 	// Record event
+-	db.Exec(
++	if _, err := tx.Exec(
+ 		`INSERT INTO order_events (order_id, event_type, old_status, new_status)
+ 		 VALUES ($1, 'status_changed', $2, $3)`,
+ 		req.OrderID, currentStatus, req.NewStatus,
+-	)
++	); err != nil {
++		httpError(w, "failed to update order", http.StatusInternalServerError)
++		return
++	}
+ 
+-	// Publish event
+-	publishEvent("order.status_changed", map[string]interface{}{
++	// Queue event
++	if err := enqueueEvent(tx, "order.status_changed", map[string]interface{}{
+ 		"order_id":   req.OrderID,
+ 		"old_status": currentStatus,
+ 		"new_status": req.NewStatus,
+-	})
++	}); err != nil {
++		log.Printf("Update status error: %v", err)
++		httpError(w, "failed to update order", http.StatusInternalServerError)
++		return
++	}
++
++	if err := tx.Commit(); err != nil {
++		httpError(w, "failed to update order", http.StatusInternalServerError)
++		return
++	}
+ 
+ 	w.Header().Set("Content-Type", "application/json")
+ 	json.NewEncoder(w).Encode(map[string]interface{}{
+@@ -371,23 +455,6 @@ func handleUpdateStatus(w http.ResponseWriter, r *http.Request) {
+ 	})
+ }
+ 
+-func publishEvent(eventType string, payload map[string]interface{}) {
+-	sqsQueue := os.Getenv("SQS_QUEUE_URL")
+-	if sqsQueue == "" {
+-		log.Printf("Event (no SQS): %s %v", eventType, payload)
+-		return
+-	}
+-
+-	event := map[string]interface{}{
+-		"type":      eventType,
+-		"payload":   payload,
+-		"timestamp": time.Now().UTC().Format(time.RFC3339),
+-	}
+-	data, _ := json.Marshal(event)
+-	log.Printf("Event -> SQS: %s", string(data))
+-	// Students implement actual SQS SendMessage here
+-}
+-
+ func httpError(w http.ResponseWriter, msg string, code int) {
+ 	w.Header().Set("Content-Type", "application/json")
+ 	w.WriteHeader(code)

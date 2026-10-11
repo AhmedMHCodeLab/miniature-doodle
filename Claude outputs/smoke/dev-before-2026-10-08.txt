@@ -1,0 +1,30 @@
+Smoke test against https://dashboard.dev.eksv2.naimaosmann.com  (2026-10-08T02:12:43+03:00)  -insecure (LE staging cert)
+Deployed: main 90ad23c images (before ALPHA-81 fixes)
+
+PASS  health: orders / inventory / payments / notifications / shipping   HTTP 200
+PASS  login                                                      HTTP 200
+PASS  pick a product with stock                                  mon-001 (27 inch Monitor): stock 50, reserved 0
+PASS  place order                                                HTTP 201, order #2
+FAIL  retry with same Idempotency-Key returns the same order     a second order #3 was created (idempotency not deployed); cancelled it
+PASS  order confirmed by the worker (reserve -> charge -> commit) #2
+PASS  stock committed (stock -1, reserved back to before)        stock 50 -> 49, reserved 0 -> 0
+PASS  payment charge in the ledger                               Order #2 payment
+PASS  order_confirmed email
+PASS  advance to processing / shipped / delivered                HTTP 200 each
+PASS  shipment created and delivered                             shipment status: delivered
+PASS  order_shipped email
+PASS  order_delivered email
+PASS  place second order (to cancel)                             HTTP 201, order #4
+PASS  order confirmed by the worker                              #4
+PASS  cancel the paid order                                      HTTP 200 confirmed -> cancelled
+PASS  refund in the ledger                                       Order #4 refund
+PASS  stock returned after cancel                                stock 49, reserved 0
+FAIL  order_cancelled email
+FAIL  blocked from outside: POST /api/payments/charge            HTTP 400 (reached payment-service)
+FAIL  blocked from outside: POST /api/payments/refund            HTTP 400 (reached payment-service)
+FAIL  blocked from outside: POST /api/inventory/reserve          HTTP 201 (reached inventory-service; empty probe, no data changed)
+FAIL  blocked from outside: POST /api/inventory/restock          HTTP 200 (reached inventory-service; order 0 had nothing, no data changed)
+FAIL  blocked from outside: POST /api/shipping/shipments         HTTP 400 (reached shipping-service)
+FAIL  blocked from outside: POST /api/notifications/send         HTTP 400 (reached notification-service)
+
+8 step(s) failed

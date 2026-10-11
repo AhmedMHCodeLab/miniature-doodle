@@ -1,0 +1,15 @@
+fix(app): make the order flow safe end to end (ALPHA-81)
+
+- order-service: refuse a status change when the order has already moved on
+  (expected_status guard); scheduler cancels abandoned orders through it
+- api-gateway: forward only the routes meant for the outside world (404 otherwise)
+- dashboard: escape API data before it goes into the page (stored XSS);
+  remove the Confirm button that skipped payment
+- shipping-service: carrier webhook only accepts in_transit and delivered
+- scheduler: give expired stock back once, count time in the database,
+  prune old rows (events 90d, sent outbox 7d, notifications 90d)
+- inventory-service: time a hold with the database clock; refuse /commit
+  when the order has no active hold (409)
+- worker: take the stock again if the hold expired before the commit
+  (or cancel and refund if it is gone); email the customer on cancel
+- notification-service: order_cancelled template

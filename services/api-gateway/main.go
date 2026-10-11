@@ -213,6 +213,10 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	} else {
 		claims, err := validateToken(r)
 		if err != nil {
+			// Missing or bad tokens count against the client IP; good tokens never do.
+			if rateLimited(w, r, scopeBadToken, clientIP(r), rlConfig.sensitiveLimit) {
+				return
+			}
 			httpError(w, "unauthorized: "+err.Error(), http.StatusUnauthorized)
 			return
 		}
@@ -237,7 +241,8 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 
 	// Find matching route
 	for prefix, targetURL := range routes {
-		if strings.HasPrefix(r.URL.Path, prefix) {
+		// Match whole path segments: /api/orders and /api/orders/..., not /api/ordersX.
+		if r.URL.Path == prefix || strings.HasPrefix(r.URL.Path, strings.TrimSuffix(prefix, "/")+"/") {
 			// Strip the route prefix for downstream. dashboard-api serves /dashboard/*
 			// under that exact path, so that route keeps it.
 			if prefix != "/dashboard/" {
@@ -245,6 +250,11 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path == "" {
 					r.URL.Path = "/"
 				}
+			}
+			// Only routes meant for the outside world are forwarded (see allowlist.go).
+			if !isExposed(prefix, r.Method, r.URL.Path) {
+				httpError(w, "not found", http.StatusNotFound)
+				return
 			}
 			forward(w, r, targetURL)
 			return
@@ -273,7 +283,11 @@ func forward(w http.ResponseWriter, r *http.Request, targetURL string) {
 		httpError(w, "service unavailable", http.StatusBadGateway)
 	}
 
-	r.Header.Set("X-Forwarded-For", r.RemoteAddr)
+	// Keep X-Forwarded-For only when it comes from a trusted proxy.
+	if !fromTrustedProxy(r) {
+		r.Header.Del("X-Forwarded-For")
+	}
+	r.Header.Set("X-Real-IP", clientIP(r))
 	r.Header.Set("X-Request-ID", fmt.Sprintf("%d", time.Now().UnixNano()))
 
 	proxy.ServeHTTP(w, r)
@@ -358,6 +372,7 @@ const (
 	scopeUser      = "user"      // authenticated traffic, keyed by JWT subject
 	scopeIP        = "ip"        // anonymous traffic, keyed by client IP
 	scopeSensitive = "sensitive" // login/register/webhook, keyed by client IP, stricter
+	scopeBadToken  = "badtoken"  // missing or invalid token on a protected route, keyed by client IP
 )
 
 // Each Redis call gets a short deadline so a slow Redis cannot stall requests;
@@ -438,6 +453,16 @@ func isTrustedProxy(ip net.IP) bool {
 		}
 	}
 	return false
+}
+
+// fromTrustedProxy reports whether the direct peer of this request is a trusted proxy.
+func fromTrustedProxy(r *http.Request) bool {
+	host := r.RemoteAddr
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && isTrustedProxy(ip)
 }
 
 // clientIP returns the caller's IP without the port.

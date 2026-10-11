@@ -1,0 +1,6 @@
+3b9d1be67fac94b8d1e940f6076bb60d0293b072 feat(inventory-service): expose Prometheus DB pool metrics
+8d8221024dee200d70211431f43aa48b11dafb08 chore(compose): name each service's database connections
+456d083f4909badd77f957b2b7c8bd7727782eab chore(compose): add gateway rate-limit settings and metrics port
+a0841b96b81a14c5cf9589a697c1439323358b3f fix(api-gateway): rate limit on real client identity
+8a1f4e1cb3902057d8e9349b65a1cf7e0c3a8a3c feat(order-service): deliver order events through a transactional outbox
+7147e837408c2925a0bf4ac76ff635b2ce91706a feat(order-service): add SQS publisher

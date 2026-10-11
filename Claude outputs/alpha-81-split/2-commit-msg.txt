@@ -1,0 +1,7 @@
+feat(order-service): require an Idempotency-Key on POST /orders (ALPHA-NNN)
+
+A retried order request with the same key returns the first order
+instead of creating a second one (200 + Idempotent-Replayed: true).
+Same key with a different body is 422; missing key is 400. Keys are
+per customer and pruned after 24h by the scheduler. The dashboard
+sends a key and reuses it when the first attempt got no clear answer.

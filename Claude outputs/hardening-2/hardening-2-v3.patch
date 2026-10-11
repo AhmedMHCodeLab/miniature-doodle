@@ -1,0 +1,3668 @@
+diff --git a/docker-compose.yml b/docker-compose.yml
+index 5156f4a..553d6a3 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -29,6 +29,8 @@ services:
+ 
+   redis:
+     image: redis:7-alpine
++    # Same as EKS: Redis refuses clients without the password. Local-only value.
++    command: ["redis-server", "--requirepass", "localdev"]
+     ports:
+       - "6379:6379"
+ 
+@@ -49,7 +51,11 @@ services:
+     environment:
+       <<: *service-urls
+       REDIS_URL: redis://redis:6379
++      REDIS_PASSWORD: localdev
+       JWT_SECRET: local-dev-secret
++      # The one dashboard login. Local-only values; on EKS the password comes from Secrets Manager.
++      ADMIN_EMAIL: admin@platform.local
++      ADMIN_PASSWORD: admin
+       DASHBOARD_SERVICE_URL: http://dashboard-api:8086
+       # Rate limits per window (defaults shown). No proxy locally, so no trusted proxies.
+       RATE_LIMIT_WINDOW_SECONDS: "60"
+@@ -115,6 +121,8 @@ services:
+     environment:
+       <<: [*database-env, *floci-env]
+       PGAPPNAME: shipping-service
++      # Shared with the carrier to sign webhook calls. Local-only value.
++      CARRIER_WEBHOOK_SECRET: local-carrier-secret
+     depends_on:
+       - postgres
+       - floci
+diff --git a/infra/terraform/main.tf b/infra/terraform/main.tf
+index 1c963d0..9b59aa5 100644
+--- a/infra/terraform/main.tf
++++ b/infra/terraform/main.tf
+@@ -22,18 +22,21 @@ module "eks" {
+ module "pod-identity" {
+   source = "./modules/pod-identity"
+ 
+-  db_credentials_secret_arn = module.secrets_manager.db_credentials_secret_arn
+-  db_connection_secret_arn  = module.rds.db_connection_secret_arn
+-  grafana_secret_arn        = module.secrets_manager.grafana_password_secret_arn
+-  jwt_secret_arn            = module.secrets_manager.jwt_secret_arn
+-  project_name              = var.project_name
+-  cluster_name              = module.eks.cluster_name
+-  kms_key_arn               = module.secrets_manager.kms_key_arn
+-  environment               = var.environment
+-  aws_region                = var.aws_region
+-  worker_node_role_arn      = module.eks.node_role_arn
+-  sqs_queue_arn             = module.sqs.queue_arn
+-  route53_hosted_zone_arn   = data.aws_route53_zone.main.arn
++  db_credentials_secret_arn  = module.secrets_manager.db_credentials_secret_arn
++  db_connection_secret_arn   = module.rds.db_connection_secret_arn
++  grafana_secret_arn         = module.secrets_manager.grafana_password_secret_arn
++  jwt_secret_arn             = module.secrets_manager.jwt_secret_arn
++  redis_password_secret_arn  = module.secrets_manager.redis_password_secret_arn
++  admin_password_secret_arn  = module.secrets_manager.admin_password_secret_arn
++  carrier_webhook_secret_arn = module.secrets_manager.carrier_webhook_secret_arn
++  project_name               = var.project_name
++  cluster_name               = module.eks.cluster_name
++  kms_key_arn                = module.secrets_manager.kms_key_arn
++  environment                = var.environment
++  aws_region                 = var.aws_region
++  worker_node_role_arn       = module.eks.node_role_arn
++  sqs_queue_arn              = module.sqs.queue_arn
++  route53_hosted_zone_arn    = data.aws_route53_zone.main.arn
+ 
+ }
+ 
+diff --git a/infra/terraform/modules/eks/addons.tf b/infra/terraform/modules/eks/addons.tf
+index f7dc221..ed4f564 100644
+--- a/infra/terraform/modules/eks/addons.tf
++++ b/infra/terraform/modules/eks/addons.tf
+@@ -3,6 +3,12 @@
+ resource "aws_eks_addon" "vpc_cni" {
+   cluster_name = aws_eks_cluster.this.name
+   addon_name   = "vpc-cni"
++
++  # Turns on the network policy agent, so Kubernetes NetworkPolicies are enforced (without
++  # it they are accepted and ignored). Standard mode: pods no policy selects stay open.
++  configuration_values = jsonencode({
++    enableNetworkPolicy = "true"
++  })
+ }
+ 
+ resource "aws_eks_addon" "kube_proxy" {
+diff --git a/infra/terraform/modules/pod-identity/main.tf b/infra/terraform/modules/pod-identity/main.tf
+index 7df64b5..271cc2f 100644
+--- a/infra/terraform/modules/pod-identity/main.tf
++++ b/infra/terraform/modules/pod-identity/main.tf
+@@ -41,7 +41,10 @@ resource "aws_iam_policy" "secrets_manager_read" {
+           var.db_credentials_secret_arn,
+           var.db_connection_secret_arn,
+           var.grafana_secret_arn,
+-          var.jwt_secret_arn
++          var.jwt_secret_arn,
++          var.redis_password_secret_arn,
++          var.admin_password_secret_arn,
++          var.carrier_webhook_secret_arn
+         ]
+       },
+       {
+diff --git a/infra/terraform/modules/pod-identity/variable.tf b/infra/terraform/modules/pod-identity/variable.tf
+index 86d4bac..5cca5a3 100644
+--- a/infra/terraform/modules/pod-identity/variable.tf
++++ b/infra/terraform/modules/pod-identity/variable.tf
+@@ -29,6 +29,21 @@ variable "jwt_secret_arn" {
+   type        = string
+ }
+ 
++variable "redis_password_secret_arn" {
++  description = "ARN of the Redis password secret"
++  type        = string
++}
++
++variable "admin_password_secret_arn" {
++  description = "ARN of the dashboard admin password secret"
++  type        = string
++}
++
++variable "carrier_webhook_secret_arn" {
++  description = "ARN of the carrier webhook signing secret"
++  type        = string
++}
++
+ variable "kms_key_arn" {
+   description = "ARN of the KMS key used to encrypt secrets"
+   type        = string
+diff --git a/infra/terraform/modules/secrets-manager/README.md b/infra/terraform/modules/secrets-manager/README.md
+index 61ddb3c..615632f 100644
+--- a/infra/terraform/modules/secrets-manager/README.md
++++ b/infra/terraform/modules/secrets-manager/README.md
+@@ -11,6 +11,9 @@ application, encrypted using a customer-managed KMS key.
+ - KMS alias
+ - Grafana password secret
+ - api-gateway JWT signing secret (`<project>-<environment>-jwt-secret`)
++- Redis password (`<project>-<environment>-redis-password`), letters and digits only
++- Dashboard admin password (`<project>-<environment>-admin-password`), letters and digits only
++- Carrier webhook signing secret (`<project>-<environment>-carrier-webhook-secret`)
+ - Database credentials secret (`<project>-<environment>-db-credentials`), JSON `{"username", "password"}`
+ - Independently generated values for each secret
+ 
+@@ -33,6 +36,9 @@ The rds module reads the database password from this secret, so RDS and the apps
+ | db_username | RDS master username stored in the secret |
+ | grafana_password_secret_arn | ARN of the Grafana password secret |
+ | jwt_secret_arn | ARN of the api-gateway JWT signing secret |
++| redis_password_secret_arn | ARN of the Redis password secret |
++| admin_password_secret_arn | ARN of the dashboard admin password secret |
++| carrier_webhook_secret_arn | ARN of the carrier webhook signing secret |
+ | kms_key_arn | ARN of the KMS key used to encrypt secrets |
+ 
+ ## Local Testing
+diff --git a/infra/terraform/modules/secrets-manager/main.tf b/infra/terraform/modules/secrets-manager/main.tf
+index 84754d3..322940f 100644
+--- a/infra/terraform/modules/secrets-manager/main.tf
++++ b/infra/terraform/modules/secrets-manager/main.tf
+@@ -47,6 +47,70 @@ resource "aws_secretsmanager_secret_version" "jwt_secret" {
+   secret_string_wo_version = 1
+ }
+ 
++# Redis password (rate-limit store), read by Redis itself and by api-gateway.
++# Letters and digits only: it is written into a one-line redis.conf.
++resource "aws_secretsmanager_secret" "redis_password" {
++  name       = "${var.project_name}-${var.environment}-redis-password"
++  kms_key_id = aws_kms_key.secret_encryption.arn
++
++  # dev only: delete immediately so destroy/apply cycles can reuse the name; prod keeps the default 30-day recovery window
++  recovery_window_in_days = 0
++}
++
++ephemeral "aws_secretsmanager_random_password" "redis_password" {
++  password_length     = 48
++  exclude_punctuation = true
++}
++
++resource "aws_secretsmanager_secret_version" "redis_password" {
++  secret_id = aws_secretsmanager_secret.redis_password.id
++
++  secret_string_wo         = ephemeral.aws_secretsmanager_random_password.redis_password.random_password
++  secret_string_wo_version = 1
++}
++
++# The dashboard admin password. People read it from Secrets Manager to log in.
++resource "aws_secretsmanager_secret" "admin_password" {
++  name       = "${var.project_name}-${var.environment}-admin-password"
++  kms_key_id = aws_kms_key.secret_encryption.arn
++
++  # dev only: delete immediately so destroy/apply cycles can reuse the name; prod keeps the default 30-day recovery window
++  recovery_window_in_days = 0
++}
++
++ephemeral "aws_secretsmanager_random_password" "admin_password" {
++  password_length     = 32
++  exclude_punctuation = true
++}
++
++resource "aws_secretsmanager_secret_version" "admin_password" {
++  secret_id = aws_secretsmanager_secret.admin_password.id
++
++  secret_string_wo         = ephemeral.aws_secretsmanager_random_password.admin_password.random_password
++  secret_string_wo_version = 1
++}
++
++# Shared with the carrier; shipping-service checks every webhook call is signed with it.
++resource "aws_secretsmanager_secret" "carrier_webhook_secret" {
++  name       = "${var.project_name}-${var.environment}-carrier-webhook-secret"
++  kms_key_id = aws_kms_key.secret_encryption.arn
++
++  # dev only: delete immediately so destroy/apply cycles can reuse the name; prod keeps the default 30-day recovery window
++  recovery_window_in_days = 0
++}
++
++ephemeral "aws_secretsmanager_random_password" "carrier_webhook_secret" {
++  password_length     = 64
++  exclude_punctuation = true
++}
++
++resource "aws_secretsmanager_secret_version" "carrier_webhook_secret" {
++  secret_id = aws_secretsmanager_secret.carrier_webhook_secret.id
++
++  secret_string_wo         = ephemeral.aws_secretsmanager_random_password.carrier_webhook_secret.random_password
++  secret_string_wo_version = 1
++}
++
+ resource "aws_secretsmanager_secret" "db_credentials" {
+   name       = "${var.project_name}-${var.environment}-db-credentials"
+   kms_key_id = aws_kms_key.secret_encryption.arn
+diff --git a/infra/terraform/modules/secrets-manager/outputs.tf b/infra/terraform/modules/secrets-manager/outputs.tf
+index ac19611..e106206 100644
+--- a/infra/terraform/modules/secrets-manager/outputs.tf
++++ b/infra/terraform/modules/secrets-manager/outputs.tf
+@@ -27,3 +27,18 @@ output "db_username" {
+   description = "RDS master username stored in the database credentials secret"
+   value       = var.db_username
+ }
++
++output "redis_password_secret_arn" {
++  description = "ARN of the Redis password secret"
++  value       = aws_secretsmanager_secret.redis_password.arn
++}
++
++output "admin_password_secret_arn" {
++  description = "ARN of the dashboard admin password secret"
++  value       = aws_secretsmanager_secret.admin_password.arn
++}
++
++output "carrier_webhook_secret_arn" {
++  description = "ARN of the carrier webhook signing secret"
++  value       = aws_secretsmanager_secret.carrier_webhook_secret.arn
++}
+diff --git a/infra/terraform/modules/sqs/main.tf b/infra/terraform/modules/sqs/main.tf
+index 1163e73..db1cbec 100644
+--- a/infra/terraform/modules/sqs/main.tf
++++ b/infra/terraform/modules/sqs/main.tf
+@@ -38,3 +38,23 @@ resource "aws_sqs_queue_redrive_allow_policy" "order_events_dlq" {
+     sourceQueueArns   = [aws_sqs_queue.order_events.arn]
+   })
+ }
++
++# Fires when any message sits in the DLQ: an order event failed 3 times and its order is
++# stuck until someone looks (runbook: docs/sqs). AWS recommends ApproximateNumberOfMessagesVisible
++# for DLQs; NumberOfMessagesSent does not count messages moved there by the redrive policy.
++# A quiet queue sends no data points, which counts as fine, not as an alarm.
++resource "aws_cloudwatch_metric_alarm" "order_events_dlq_not_empty" {
++  alarm_name          = "${var.project_name}-${var.environment}-order-events-dlq-not-empty"
++  alarm_description   = "Order events failed 3 times and are waiting in the DLQ. Runbook: docs/sqs/dlq-runbook.md"
++  namespace           = "AWS/SQS"
++  metric_name         = "ApproximateNumberOfMessagesVisible"
++  dimensions          = { QueueName = aws_sqs_queue.order_events_dlq.name }
++  statistic           = "Maximum"
++  period              = 300
++  evaluation_periods  = 1
++  threshold           = 1
++  comparison_operator = "GreaterThanOrEqualToThreshold"
++  treat_missing_data  = "notBreaching"
++  alarm_actions       = var.dlq_alarm_actions
++  ok_actions          = var.dlq_alarm_actions
++}
+diff --git a/infra/terraform/modules/sqs/output.tf b/infra/terraform/modules/sqs/output.tf
+index a5506d0..79441be 100644
+--- a/infra/terraform/modules/sqs/output.tf
++++ b/infra/terraform/modules/sqs/output.tf
+@@ -12,3 +12,8 @@ output "dlq_arn" {
+   description = "ARN of the order-events dead-letter queue"
+   value       = aws_sqs_queue.order_events_dlq.arn
+ }
++
++output "dlq_alarm_name" {
++  description = "Name of the CloudWatch alarm that fires when the DLQ is not empty"
++  value       = aws_cloudwatch_metric_alarm.order_events_dlq_not_empty.alarm_name
++}
+diff --git a/infra/terraform/modules/sqs/variable.tf b/infra/terraform/modules/sqs/variable.tf
+index b1a19ad..f2660c7 100644
+--- a/infra/terraform/modules/sqs/variable.tf
++++ b/infra/terraform/modules/sqs/variable.tf
+@@ -8,3 +8,9 @@ variable "environment" {
+   description = "Environment name (dev, staging, prod)"
+   type        = string
+ }
++
++variable "dlq_alarm_actions" {
++  description = "Where the DLQ alarm notifies (for example an SNS topic ARN). Empty: the alarm only shows in CloudWatch"
++  type        = list(string)
++  default     = []
++}
+diff --git a/kubernetes/charts/microservice/ci/test-values.yaml b/kubernetes/charts/microservice/ci/test-values.yaml
+index 3119429..398172c 100644
+--- a/kubernetes/charts/microservice/ci/test-values.yaml
++++ b/kubernetes/charts/microservice/ci/test-values.yaml
+@@ -25,6 +25,8 @@ serviceMonitor:
+ ingressRoute:
+   enabled: true
+   host: api.example.com
++  rateLimit:
++    enabled: true
+ resources:
+   requests:
+     cpu: 50m
+diff --git a/kubernetes/charts/microservice/templates/ingressroute.yaml b/kubernetes/charts/microservice/templates/ingressroute.yaml
+index 0231d37..e3cad48 100644
+--- a/kubernetes/charts/microservice/templates/ingressroute.yaml
++++ b/kubernetes/charts/microservice/templates/ingressroute.yaml
+@@ -12,9 +12,14 @@ spec:
+   routes:
+     - kind: Rule
+       match: Host(`{{ $host }}`)
+-      {{- with .Values.ingressRoute.middlewares }}
++      {{- if or .Values.ingressRoute.rateLimit.enabled .Values.ingressRoute.middlewares }}
+       middlewares:
++        {{- if .Values.ingressRoute.rateLimit.enabled }}
++        - name: {{ include "microservice.fullname" . }}-ratelimit
++        {{- end }}
++        {{- with .Values.ingressRoute.middlewares }}
+         {{- toYaml . | nindent 8 }}
++        {{- end }}
+       {{- end }}
+       services:
+         - name: {{ include "microservice.fullname" . }}
+diff --git a/kubernetes/charts/microservice/templates/middleware-ratelimit.yaml b/kubernetes/charts/microservice/templates/middleware-ratelimit.yaml
+new file mode 100644
+index 0000000..e020487
+--- /dev/null
++++ b/kubernetes/charts/microservice/templates/middleware-ratelimit.yaml
+@@ -0,0 +1,16 @@
++{{- if and .Values.ingressRoute.enabled .Values.ingressRoute.rateLimit.enabled }}
++{{- $rl := .Values.ingressRoute.rateLimit }}
++# Per client IP limit at the edge. The NLB keeps the client's address
++# (preserve_client_ip), so Traefik's default source, the remote address, is the client.
++apiVersion: traefik.io/v1alpha1
++kind: Middleware
++metadata:
++  name: {{ include "microservice.fullname" . }}-ratelimit
++  labels:
++    {{- include "microservice.labels" . | nindent 4 }}
++spec:
++  rateLimit:
++    average: {{ $rl.average }}
++    period: {{ $rl.period }}
++    burst: {{ $rl.burst }}
++{{- end }}
+diff --git a/kubernetes/charts/microservice/values.schema.json b/kubernetes/charts/microservice/values.schema.json
+index 1ff8aa6..0bdbbe9 100644
+--- a/kubernetes/charts/microservice/values.schema.json
++++ b/kubernetes/charts/microservice/values.schema.json
+@@ -431,6 +431,27 @@
+               "minLength": 1
+             }
+           }
++        },
++        "rateLimit": {
++          "type": "object",
++          "additionalProperties": false,
++          "properties": {
++            "enabled": {
++              "type": "boolean"
++            },
++            "average": {
++              "type": "integer",
++              "minimum": 1
++            },
++            "period": {
++              "type": "string",
++              "minLength": 1
++            },
++            "burst": {
++              "type": "integer",
++              "minimum": 1
++            }
++          }
+         }
+       }
+     },
+diff --git a/kubernetes/charts/microservice/values.yaml b/kubernetes/charts/microservice/values.yaml
+index 806b0ca..3d6d4bd 100644
+--- a/kubernetes/charts/microservice/values.yaml
++++ b/kubernetes/charts/microservice/values.yaml
+@@ -186,6 +186,16 @@ ingressRoute:
+   entryPoints:
+     - websecure
+   middlewares: []
++  # -- Per client IP limit at the edge (Traefik RateLimit middleware), before requests
++  # reach the pods. Counted per Traefik pod, in memory. Leave it well above normal use:
++  # it is there to stop one client flooding, not to replace the gateway's own limits.
++  rateLimit:
++    enabled: false
++    # -- Requests allowed per period, per client IP, per Traefik pod.
++    average: 20
++    period: 1s
++    # -- Requests allowed at the same moment above the average.
++    burst: 50
+   tls:
+     # -- Create a cert-manager Certificate for host.
+     enabled: true
+diff --git a/kubernetes/deploy/envs/dev/api-gateway.yaml b/kubernetes/deploy/envs/dev/api-gateway.yaml
+index b5f9975..9949b76 100644
+--- a/kubernetes/deploy/envs/dev/api-gateway.yaml
++++ b/kubernetes/deploy/envs/dev/api-gateway.yaml
+@@ -14,9 +14,17 @@ externalSecrets:
+   env:
+     - name: JWT_SECRET
+       key: eks-v2-dev-jwt-secret
++    - name: ADMIN_PASSWORD
++      key: eks-v2-dev-admin-password
++    - name: REDIS_PASSWORD
++      key: eks-v2-dev-redis-password
+ 
+ ingressRoute:
+   enabled: true
++  # Edge guard against one client flooding: 20 req/s per client IP per Traefik pod
++  # (2 pods), burst 50. The gateway's own limits (per user, per IP) still apply behind it.
++  rateLimit:
++    enabled: true
+   # Must equal external-dns.alpha.kubernetes.io/hostname in kubernetes/helm-values/traefik-values.yaml
+   host: dashboard.dev.eksv2.naimaosmann.com
+   tls:
+diff --git a/kubernetes/deploy/envs/dev/shipping-service.yaml b/kubernetes/deploy/envs/dev/shipping-service.yaml
+index bae4f00..1f7ac12 100644
+--- a/kubernetes/deploy/envs/dev/shipping-service.yaml
++++ b/kubernetes/deploy/envs/dev/shipping-service.yaml
+@@ -3,3 +3,9 @@ image:
+   tag: shipping-service-28c526e5
+ 
+ replicaCount: 1
++
++externalSecrets:
++  env:
++    # Shared with the carrier to sign webhook calls.
++    - name: CARRIER_WEBHOOK_SECRET
++      key: eks-v2-dev-carrier-webhook-secret
+diff --git a/kubernetes/deploy/services/api-gateway/values.yaml b/kubernetes/deploy/services/api-gateway/values.yaml
+index 8427406..7cf3b4e 100644
+--- a/kubernetes/deploy/services/api-gateway/values.yaml
++++ b/kubernetes/deploy/services/api-gateway/values.yaml
+@@ -5,6 +5,8 @@ metricsPort: 9090
+ 
+ env:
+   REDIS_URL: redis://redis:6379
++  # The one dashboard login. Its password comes from Secrets Manager (see envs/<env>/api-gateway.yaml).
++  ADMIN_EMAIL: admin@platform.local
+ 
+ # JWT_SECRET key is environment-specific: see kubernetes/deploy/envs/<env>/api-gateway.yaml
+ 
+diff --git a/kubernetes/deploy/services/scheduler/values.yaml b/kubernetes/deploy/services/scheduler/values.yaml
+index 5b845b4..753de49 100644
+--- a/kubernetes/deploy/services/scheduler/values.yaml
++++ b/kubernetes/deploy/services/scheduler/values.yaml
+@@ -10,8 +10,10 @@ env:
+ database:
+   enabled: true
+ 
++# A ClusterIP Service so dashboard-api can show this service's health on the Services
++# tab. Inside the cluster only; the gateway does not route to it.
+ service:
+-  enabled: false
++  enabled: true
+ 
+ resources:
+   requests:
+diff --git a/kubernetes/deploy/services/worker/values.yaml b/kubernetes/deploy/services/worker/values.yaml
+index 8ca81ea..7ef7e38 100644
+--- a/kubernetes/deploy/services/worker/values.yaml
++++ b/kubernetes/deploy/services/worker/values.yaml
+@@ -3,8 +3,10 @@ component: worker
+ containerPort: 8090
+ portEnvName: HEALTH_PORT
+ 
++# A ClusterIP Service so dashboard-api can show this service's health on the Services
++# tab. Inside the cluster only; the gateway does not route to it.
+ service:
+-  enabled: false
++  enabled: true
+ 
+ resources:
+   requests:
+diff --git a/kubernetes/platform/redis/README.md b/kubernetes/platform/redis/README.md
+index d4f2fc8..f62873f 100644
+--- a/kubernetes/platform/redis/README.md
++++ b/kubernetes/platform/redis/README.md
+@@ -1,11 +1,12 @@
+ # Redis
+ 
+-Rate-limit counters for api-gateway. One pod in `order-platform`, a 1Gi encrypted gp3 disk, AOF on, no password. Not deployed yet.
++Rate-limit counters for api-gateway. One pod in `order-platform`, a 1Gi encrypted gp3 disk, AOF on, password required.
+ 
+ | File | What |
+ |---|---|
+ | `statefulset.yaml` | The pod and its disk |
+ | `service.yaml` | `redis` (what the gateway uses) and `redis-headless` |
++| `externalsecret.yaml` | `redis-auth`: the password from Secrets Manager (`eks-v2-dev-redis-password`), as a one-line config file and as a plain key for the probes |
+ | `../apps/redis.yaml` | The ArgoCD app, sync wave -1 |
+ | `../manifests/storageclass-gp3.yaml` | The gp3 StorageClass, cluster default |
+ | `../manifests/namespace-order-platform.yaml` | The namespace |
+@@ -15,6 +16,7 @@ Keep these true:
+ - The Service is called `redis` and lives in `order-platform`. The gateway's `REDIS_URL` depends on it.
+ - `--appendonly yes`, `--dir /data` and the disk at `/data` stay together. The root filesystem is read-only.
+ - `whenDeleted: Delete` stays, or teardown leaves a billed disk behind.
++- The password lives only in Secrets Manager. Redis reads it from `/etc/redis/redis.conf` (mounted from `redis-auth`), the probes from `REDISCLI_AUTH`, and the gateway from `REDIS_PASSWORD`. Changing it in Secrets Manager restarts Redis and the gateway through Reloader.
+ - The image tag stays exact (`redis:7.4.11-alpine`). docker-compose still runs `redis:7-alpine`, not aligned yet.
+ 
+ Why it is built this way and the options we weighed: ADR 0006 in Plane (ALPHA-89).
+diff --git a/kubernetes/platform/redis/externalsecret.yaml b/kubernetes/platform/redis/externalsecret.yaml
+new file mode 100644
+index 0000000..6bc0a2e
+--- /dev/null
++++ b/kubernetes/platform/redis/externalsecret.yaml
+@@ -0,0 +1,24 @@
++apiVersion: external-secrets.io/v1
++kind: ExternalSecret
++metadata:
++  name: redis-auth
++  namespace: order-platform
++spec:
++  refreshInterval: 1h
++  secretStoreRef:
++    name: aws-secrets-manager
++    kind: ClusterSecretStore
++  target:
++    name: redis-auth
++    creationPolicy: Owner
++    template:
++      engineVersion: v2
++      data:
++        # Read by redis-server as a config file, so the password is never on the command line.
++        redis.conf: "requirepass {{ .password }}"
++        # Read by redis-cli in the probes (REDISCLI_AUTH).
++        password: "{{ .password }}"
++  data:
++    - secretKey: password
++      remoteRef:
++        key: eks-v2-dev-redis-password
+diff --git a/kubernetes/platform/redis/networkpolicy.yaml b/kubernetes/platform/redis/networkpolicy.yaml
+new file mode 100644
+index 0000000..d37e196
+--- /dev/null
++++ b/kubernetes/platform/redis/networkpolicy.yaml
+@@ -0,0 +1,22 @@
++# Only api-gateway may connect to Redis. Every other pod in the cluster is refused.
++# Needs the VPC CNI network policy agent (enableNetworkPolicy in the eks module);
++# without it this policy is accepted but does nothing.
++apiVersion: networking.k8s.io/v1
++kind: NetworkPolicy
++metadata:
++  name: redis-only-from-gateway
++  namespace: order-platform
++spec:
++  podSelector:
++    matchLabels:
++      app.kubernetes.io/name: redis
++  policyTypes:
++    - Ingress
++  ingress:
++    - from:
++        - podSelector:
++            matchLabels:
++              app.kubernetes.io/name: api-gateway
++      ports:
++        - protocol: TCP
++          port: 6379
+diff --git a/kubernetes/platform/redis/statefulset.yaml b/kubernetes/platform/redis/statefulset.yaml
+index 9895fe6..5fed9b1 100644
+--- a/kubernetes/platform/redis/statefulset.yaml
++++ b/kubernetes/platform/redis/statefulset.yaml
+@@ -17,6 +17,9 @@ spec:
+     metadata:
+       labels:
+         app.kubernetes.io/name: redis
++      annotations:
++        # Restart Redis when the password changes in Secrets Manager.
++        secret.reloader.stakater.com/reload: redis-auth
+     spec:
+       automountServiceAccountToken: false
+       securityContext:
+@@ -29,11 +32,20 @@ spec:
+       containers:
+         - name: redis
+           image: redis:7.4.11-alpine
++          # The first argument is a config file holding only "requirepass ...", from the
++          # redis-auth Secret. Keeping the password out of args keeps it out of `ps`.
+           args:
++            - /etc/redis/redis.conf
+             - --appendonly
+             - "yes"
+             - --dir
+             - /data
++          env:
++            - name: REDISCLI_AUTH
++              valueFrom:
++                secretKeyRef:
++                  name: redis-auth
++                  key: password
+           ports:
+             - name: redis
+               containerPort: 6379
+@@ -60,6 +72,16 @@ spec:
+           volumeMounts:
+             - name: data
+               mountPath: /data
++            - name: auth
++              mountPath: /etc/redis
++              readOnly: true
++      volumes:
++        - name: auth
++          secret:
++            secretName: redis-auth
++            items:
++              - key: redis.conf
++                path: redis.conf
+   volumeClaimTemplates:
+     - metadata:
+         name: data
+diff --git a/scripts/smoke/main.go b/scripts/smoke/main.go
+new file mode 100644
+index 0000000..d41ceff
+--- /dev/null
++++ b/scripts/smoke/main.go
+@@ -0,0 +1,461 @@
++// Smoke test for the order platform: runs one real order flow through the public
++// entry point and prints PASS / FAIL / WARN per step. Run from the repo root:
++//
++//	go run scripts/smoke/main.go -base http://localhost:8080
++//	go run scripts/smoke/main.go -base https://dashboard.dev.eksv2.naimaosmann.com -insecure -password "<admin password>"
++//
++// The admin password on EKS is in Secrets Manager (eks-v2-<env>-admin-password).
++//
++// Stock numbers are compared with a baseline, so other people ordering the same product
++// during the run can make a stock step fail; rerun when the platform is quiet.
++// It creates real data: two orders (one taken to delivered, one cancelled), so stock,
++// payments, shipments and emails change. Run it against dev or local, never prod.
++// Exit code is 1 if any step fails.
++package main
++
++import (
++	"bytes"
++	"crypto/rand"
++	"crypto/tls"
++	"encoding/hex"
++	"encoding/json"
++	"flag"
++	"fmt"
++	"io"
++	"net/http"
++	"os"
++	"strings"
++	"time"
++)
++
++var (
++	base     = flag.String("base", "http://localhost:8080", "public URL of the platform (no trailing slash)")
++	email    = flag.String("email", "admin@platform.local", "admin login email")
++	password = flag.String("password", "admin", "admin password (local: admin; EKS: read it from Secrets Manager)")
++	wait     = flag.Duration("wait", 60*time.Second, "how long to wait for each async step (worker, SQS)")
++	insecure = flag.Bool("insecure", false, "skip TLS certificate checks (dev only: Let's Encrypt staging certs are not trusted)")
++
++	client = &http.Client{Timeout: 15 * time.Second}
++	token  string
++	failed int
++)
++
++type product struct {
++	ID       string  `json:"id"`
++	Name     string  `json:"name"`
++	Price    float64 `json:"price"`
++	Stock    int     `json:"stock"`
++	Reserved int     `json:"reserved"`
++}
++
++type order struct {
++	ID     int     `json:"id"`
++	Status string  `json:"status"`
++	Total  float64 `json:"total"`
++}
++
++func main() {
++	flag.Parse()
++	*base = strings.TrimSuffix(*base, "/")
++	if *insecure {
++		client.Transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
++		fmt.Println("WARNING: TLS certificate checks are off (-insecure)")
++	}
++	// A redirect would turn POST into GET and hide the real answer, so never follow one.
++	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
++	fmt.Printf("Smoke test against %s  (%s)\n\n", *base, time.Now().Format(time.RFC3339))
++
++	// 1. Health of every service through the gateway.
++	for _, svc := range []string{"orders", "inventory", "payments", "notifications", "shipping"} {
++		code, _, err := call("GET", "/api/"+svc+"/healthz", nil, nil)
++		check(err == nil && code == 200, "health: "+svc, fmt.Sprintf("HTTP %d %v", code, errStr(err)))
++	}
++
++	// 2. Log in as the admin.
++	code, body, err := call("POST", "/auth/login", map[string]string{"email": *email, "password": *password}, nil)
++	var login struct{ Token string }
++	_ = json.Unmarshal(body, &login)
++	token = login.Token
++	if !check(err == nil && code == 200 && token != "", "login", fmt.Sprintf("HTTP %d %v", code, errStr(err))) {
++		finish()
++	}
++
++	// 3. Pick a product with at least 2 available.
++	p, ok := pickProduct()
++	if !check(ok, "pick a product with stock", p.ID) {
++		finish()
++	}
++	fmt.Printf("      using %s (%s): stock %d, reserved %d\n", p.ID, p.Name, p.Stock, p.Reserved)
++
++	// 4. Place an order with an Idempotency-Key.
++	key := newKey()
++	req := map[string]interface{}{
++		"items": []map[string]interface{}{{"product_id": p.ID, "quantity": 1}},
++		"shipping_address": map[string]string{
++			"name": "Smoke Test", "line1": "1 Test Street", "city": "Leeds", "postcode": "LS1 1AA", "country": "GB",
++		},
++	}
++	code, body, err = call("POST", "/api/orders/", req, map[string]string{"Idempotency-Key": key})
++	var o order
++	_ = json.Unmarshal(body, &o)
++	if !check(err == nil && code == 201 && o.ID > 0, "place order", fmt.Sprintf("HTTP %d, order #%d %v %s", code, o.ID, errStr(err), short(body))) {
++		finish()
++	}
++
++	// 5. Same key, same request again: must return the same order, not a new one.
++	code, body, err = call("POST", "/api/orders/", req, map[string]string{"Idempotency-Key": key})
++	var again order
++	_ = json.Unmarshal(body, &again)
++	switch {
++	case err == nil && code == 200 && again.ID == o.ID:
++		pass("retry with same Idempotency-Key returns the same order", fmt.Sprintf("#%d", o.ID))
++	case code == 201 && again.ID != o.ID:
++		fail("retry with same Idempotency-Key returns the same order", fmt.Sprintf("a second order #%d was created (idempotency not deployed); cancelling it", again.ID))
++		_, _, _ = call("PUT", "/api/orders/status", map[string]interface{}{"order_id": again.ID, "new_status": "cancelled"}, nil)
++	default:
++		fail("retry with same Idempotency-Key returns the same order", fmt.Sprintf("HTTP %d %v %s", code, errStr(err), short(body)))
++	}
++
++	// 6. The worker reserves, charges and confirms. The payment simulator declines about
++	// 1 in 10 charges on purpose; a declined order is checked and replaced with a new one.
++	o, ok = confirmOrRetry(o, p, req)
++	if !ok {
++		finish()
++	}
++
++	// 7. Stock committed: stock down by 1, reserved back where it was.
++	okInv := waitFor(func() (bool, string) {
++		q, found := getProduct(p.ID)
++		if !found {
++			return false, "product not found"
++		}
++		return q.Stock == p.Stock-1 && q.Reserved == p.Reserved,
++			fmt.Sprintf("stock %d -> %d (want %d), reserved %d -> %d (want %d)", p.Stock, q.Stock, p.Stock-1, p.Reserved, q.Reserved, p.Reserved)
++	})
++	check(okInv.ok, "stock committed (stock -1, reserved back to before)", okInv.detail)
++
++	// 8. Charge in the ledger and the confirmation email.
++	r := waitFor(func() (bool, string) { return ledgerHas(o.ID, "charge"), "" })
++	check(r.ok, "payment charge in the ledger", fmt.Sprintf("Order #%d payment", o.ID))
++	r = waitFor(func() (bool, string) { return emailSent(o.ID, "order_confirmed"), "" })
++	check(r.ok, "order_confirmed email", "")
++
++	// 9. Walk the order to delivered the way the dashboard does.
++	for _, next := range []string{"processing", "shipped", "delivered"} {
++		code, body, err = call("PUT", "/api/orders/status", map[string]interface{}{"order_id": o.ID, "new_status": next}, nil)
++		check(err == nil && code == 200, "advance to "+next, fmt.Sprintf("HTTP %d %v %s", code, errStr(err), short(body)))
++	}
++	r = waitFor(func() (bool, string) {
++		s, ok := shipmentStatus(o.ID)
++		return ok && s == "delivered", "shipment status: " + s
++	})
++	check(r.ok, "shipment created and delivered", r.detail)
++	name, city := shipmentRecipient(o.ID)
++	check(name == "Smoke Test" && city == "Leeds", "shipment uses the order's address", fmt.Sprintf("recipient %q, city %q", name, city))
++	r = waitFor(func() (bool, string) { return emailSent(o.ID, "order_shipped"), "" })
++	check(r.ok, "order_shipped email", "")
++	r = waitFor(func() (bool, string) { return emailSent(o.ID, "order_delivered"), "" })
++	check(r.ok, "order_delivered email", "")
++
++	// 10. A second order, cancelled after payment: refund, stock back, cancel email.
++	before, _ := getProduct(p.ID)
++	code, body, err = call("POST", "/api/orders/", req, map[string]string{"Idempotency-Key": newKey()})
++	var c order
++	_ = json.Unmarshal(body, &c)
++	if check(err == nil && code == 201 && c.ID > 0, "place second order (to cancel)", fmt.Sprintf("HTTP %d, order #%d", code, c.ID)) {
++		var ok bool
++		if c, ok = confirmOrRetry(c, before, req); ok {
++			code, body, err = call("PUT", "/api/orders/status", map[string]interface{}{"order_id": c.ID, "new_status": "cancelled"}, nil)
++			check(err == nil && code == 200, "cancel the paid order", fmt.Sprintf("HTTP %d %v %s", code, errStr(err), short(body)))
++			r = waitFor(func() (bool, string) { return ledgerHas(c.ID, "refund"), "" })
++			check(r.ok, "refund in the ledger", fmt.Sprintf("Order #%d refund", c.ID))
++			r = waitFor(func() (bool, string) {
++				q, _ := getProduct(p.ID)
++				return q.Stock == before.Stock && q.Reserved == before.Reserved,
++					fmt.Sprintf("stock %d (want %d), reserved %d (want %d)", q.Stock, before.Stock, q.Reserved, before.Reserved)
++			})
++			check(r.ok, "stock returned after cancel", r.detail)
++			r = waitFor(func() (bool, string) { return emailSent(c.ID, "order_cancelled"), "" })
++			check(r.ok, "order_cancelled email", "")
++		}
++	}
++
++	// 11. Doors that must stay shut: wrong password, sign-up, unsigned carrier webhook.
++	saved := token
++	token = ""
++	code, _, err = call("POST", "/auth/login", map[string]string{"email": *email, "password": *password + "-wrong"}, nil)
++	check(err == nil && code == 401, "login with a wrong password is refused", fmt.Sprintf("HTTP %d %v", code, errStr(err)))
++	code, _, err = call("POST", "/auth/register", map[string]string{"email": "smoke@test.local", "password": "x"}, nil)
++	check(err == nil && code == 403, "sign-up is closed", fmt.Sprintf("HTTP %d %v", code, errStr(err)))
++	code, _, err = call("POST", "/api/shipping/webhook", map[string]string{"tracking_number": "NONE", "status": "delivered"}, nil)
++	check(err == nil && code == 401, "unsigned carrier webhook is refused", fmt.Sprintf("HTTP %d %v", code, errStr(err)))
++	token = saved
++
++	// 12. Internal routes must not be reachable from outside (404 at the gateway).
++	// The probe names order -1 and no items, which no real order or product matches, so an
++	// unpatched service changes nothing (reserve and restock still answer 201/200 there).
++	for _, rt := range [][2]string{{"POST", "/api/payments/charge"}, {"POST", "/api/payments/refund"}, {"POST", "/api/inventory/reserve"}, {"POST", "/api/inventory/restock"}, {"POST", "/api/shipping/shipments"}, {"POST", "/api/notifications/send"}} {
++		code, _, err = call(rt[0], rt[1], map[string]interface{}{"order_id": -1}, nil)
++		check(err == nil && code == 404, "blocked from outside: "+rt[0]+" "+rt[1], fmt.Sprintf("HTTP %d %v", code, errStr(err)))
++	}
++
++	finish()
++}
++
++// ---- checks ----------------------------------------------------------------------------
++
++type result struct {
++	ok     bool
++	detail string
++}
++
++func waitFor(f func() (bool, string)) result {
++	deadline := time.Now().Add(*wait)
++	var detail string
++	for {
++		ok, d := f()
++		detail = d
++		if ok || time.Now().After(deadline) {
++			return result{ok, detail}
++		}
++		time.Sleep(2 * time.Second)
++	}
++}
++
++// confirmOrRetry waits for the order to be confirmed. If the payment simulator declined
++// it, it checks the decline path (cancelled, stock back to the baseline taken before the
++// order was placed) and tries a new order, up to 3 attempts in total.
++func confirmOrRetry(o order, before product, req interface{}) (order, bool) {
++	for attempt := 1; ; attempt++ {
++		st, ok := waitStatus(o.ID, "confirmed")
++		if ok {
++			pass("order confirmed by the worker (reserve -> charge -> commit)", fmt.Sprintf("#%d", o.ID))
++			return o, true
++		}
++		if st != "cancelled" || attempt == 3 {
++			fail("order confirmed by the worker (reserve -> charge -> commit)", fmt.Sprintf("#%d last status: %s", o.ID, st))
++			return o, false
++		}
++		// Declined: stock must be released (reserved back down, stock unchanged).
++		r := waitFor(func() (bool, string) {
++			q, _ := getProduct(before.ID)
++			return q.Reserved == before.Reserved && q.Stock == before.Stock,
++				fmt.Sprintf("stock %d, reserved %d", q.Stock, q.Reserved)
++		})
++		check(r.ok, fmt.Sprintf("declined payment on #%d: cancelled and stock released", o.ID), r.detail)
++		if emailSent(o.ID, "payment_failed") {
++			pass("payment_failed email", "")
++		} else {
++			fmt.Printf("WARN  %-58s %s\n", "payment_failed email", "not seen (best effort by design)")
++		}
++		code, body, err := call("POST", "/api/orders/", req, map[string]string{"Idempotency-Key": newKey()})
++		var n order
++		_ = json.Unmarshal(body, &n)
++		if !check(err == nil && code == 201 && n.ID > 0, "place a replacement order", fmt.Sprintf("HTTP %d, order #%d", code, n.ID)) {
++			return o, false
++		}
++		o = n
++	}
++}
++
++func waitStatus(id int, want string) (string, bool) {
++	var last string
++	r := waitFor(func() (bool, string) {
++		code, body, err := call("GET", fmt.Sprintf("/api/orders/%d", id), nil, nil)
++		if err != nil || code != 200 {
++			return false, fmt.Sprintf("HTTP %d %v", code, errStr(err))
++		}
++		var o order
++		_ = json.Unmarshal(body, &o)
++		last = o.Status
++		return o.Status == want || o.Status == "cancelled", o.Status
++	})
++	return last, r.ok && last == want
++}
++
++func pickProduct() (product, bool) {
++	code, body, err := call("GET", "/api/inventory/products", nil, nil)
++	if err != nil || code != 200 {
++		return product{ID: fmt.Sprintf("HTTP %d %v", code, errStr(err))}, false
++	}
++	var ps []product
++	_ = json.Unmarshal(body, &ps)
++	for _, p := range ps {
++		if p.Stock-p.Reserved >= 2 && p.Price > 0 {
++			return p, true
++		}
++	}
++	return product{ID: "no product has 2 or more available"}, false
++}
++
++func getProduct(id string) (product, bool) {
++	code, body, err := call("GET", "/api/inventory/products/"+id, nil, nil)
++	if err != nil || code != 200 {
++		return product{}, false
++	}
++	var p product
++	_ = json.Unmarshal(body, &p)
++	return p, p.ID != ""
++}
++
++func ledgerHas(orderID int, entryType string) bool {
++	code, body, err := call("GET", "/api/payments/ledger", nil, nil)
++	if err != nil || code != 200 {
++		return false
++	}
++	var es []struct {
++		EntryType   string `json:"entry_type"`
++		Description string `json:"description"`
++	}
++	_ = json.Unmarshal(body, &es)
++	prefix := fmt.Sprintf("Order #%d ", orderID)
++	for _, e := range es {
++		if e.EntryType == entryType && strings.HasPrefix(e.Description, prefix) {
++			return true
++		}
++	}
++	return false
++}
++
++func emailSent(orderID int, template string) bool {
++	code, body, err := call("GET", "/api/notifications/history", nil, nil)
++	if err != nil || code != 200 {
++		return false
++	}
++	var ns []struct {
++		Template string `json:"template"`
++		Subject  string `json:"subject"`
++	}
++	_ = json.Unmarshal(body, &ns)
++	suffix := fmt.Sprintf("#%d", orderID)
++	for _, n := range ns {
++		if n.Template == template && strings.HasSuffix(n.Subject, suffix) {
++			return true
++		}
++	}
++	return false
++}
++
++func shipmentRecipient(orderID int) (string, string) {
++	_, body, err := call("GET", "/api/shipping/shipments", nil, nil)
++	if err != nil {
++		return "", ""
++	}
++	var ss []struct {
++		OrderID       int    `json:"order_id"`
++		RecipientName string `json:"recipient_name"`
++		City          string `json:"city"`
++	}
++	_ = json.Unmarshal(body, &ss)
++	for _, s := range ss {
++		if s.OrderID == orderID {
++			return s.RecipientName, s.City
++		}
++	}
++	return "", ""
++}
++
++func shipmentStatus(orderID int) (string, bool) {
++	code, body, err := call("GET", "/api/shipping/shipments", nil, nil)
++	if err != nil || code != 200 {
++		return fmt.Sprintf("HTTP %d", code), false
++	}
++	var ss []struct {
++		OrderID int    `json:"order_id"`
++		Status  string `json:"status"`
++	}
++	_ = json.Unmarshal(body, &ss)
++	for _, s := range ss {
++		if s.OrderID == orderID {
++			return s.Status, true
++		}
++	}
++	return "none", false
++}
++
++// ---- http --------------------------------------------------------------------------------
++
++func call(method, path string, payload interface{}, extra map[string]string) (int, []byte, error) {
++	for attempt := 1; ; attempt++ {
++		code, body, err := callOnce(method, path, payload, extra)
++		if code != 429 || attempt == 3 {
++			return code, body, err
++		}
++		// Rate limited (a dashboard tab shares the same user): wait and retry.
++		time.Sleep(15 * time.Second)
++	}
++}
++
++func callOnce(method, path string, payload interface{}, extra map[string]string) (int, []byte, error) {
++	var rdr io.Reader
++	if payload != nil {
++		b, _ := json.Marshal(payload)
++		rdr = bytes.NewReader(b)
++	}
++	req, err := http.NewRequest(method, *base+path, rdr)
++	if err != nil {
++		return 0, nil, err
++	}
++	req.Header.Set("Content-Type", "application/json")
++	if token != "" {
++		req.Header.Set("Authorization", "Bearer "+token)
++	}
++	for k, v := range extra {
++		req.Header.Set(k, v)
++	}
++	resp, err := client.Do(req)
++	if err != nil {
++		return 0, nil, err
++	}
++	defer resp.Body.Close()
++	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
++	return resp.StatusCode, body, nil
++}
++
++func newKey() string {
++	b := make([]byte, 16)
++	_, _ = rand.Read(b)
++	return "smoke-" + hex.EncodeToString(b)
++}
++
++// ---- output ------------------------------------------------------------------------------
++
++func check(ok bool, name, detail string) bool {
++	if ok {
++		pass(name, detail)
++	} else {
++		fail(name, detail)
++	}
++	return ok
++}
++
++func pass(name, detail string) { fmt.Printf("PASS  %-58s %s\n", name, detail) }
++
++func fail(name, detail string) {
++	failed++
++	fmt.Printf("FAIL  %-58s %s\n", name, detail)
++}
++
++func finish() {
++	if failed > 0 {
++		fmt.Printf("\n%d step(s) failed\n", failed)
++		os.Exit(1)
++	}
++	fmt.Println("\nall steps passed")
++	os.Exit(0)
++}
++
++func short(b []byte) string {
++	s := strings.TrimSpace(string(b))
++	if len(s) > 160 {
++		s = s[:160] + "..."
++	}
++	return s
++}
++
++func errStr(err error) string {
++	if err == nil {
++		return ""
++	}
++	return err.Error()
++}
+diff --git a/services/api-gateway/auth_test.go b/services/api-gateway/auth_test.go
+new file mode 100644
+index 0000000..b93f06a
+--- /dev/null
++++ b/services/api-gateway/auth_test.go
+@@ -0,0 +1,116 @@
++package main
++
++import (
++	"crypto/sha256"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"testing"
++
++	"github.com/golang-jwt/jwt/v5"
++)
++
++const testAdminPassword = "correct horse battery staple"
++
++var adminLogin = `{"email":"admin@test.com","password":"` + testAdminPassword + `"}`
++
++func init() {
++	adminEmail = "admin@test.com"
++	adminDigest = sha256.Sum256([]byte(testAdminPassword))
++	adminConfigured = true
++}
++
++func TestNoAdminPasswordMeansNobodyLogsIn(t *testing.T) {
++	setLimits(t, 1000, 1000, 1000, "")
++	adminConfigured = false
++	adminDigest = sha256.Sum256(nil) // what an empty password would hash to
++	t.Cleanup(func() {
++		adminConfigured = true
++		adminDigest = sha256.Sum256([]byte(testAdminPassword))
++	})
++	rec := httptest.NewRecorder()
++	handleLogin(rec, request("POST", "/auth/login", "203.0.113.34:1", `{"email":"admin@test.com","password":""}`))
++	if rec.Code != http.StatusUnauthorized {
++		t.Fatalf("login with no admin password configured: got %d, want 401", rec.Code)
++	}
++}
++
++func TestLoginNeedsTheAdminPassword(t *testing.T) {
++	setLimits(t, 1000, 1000, 1000, "")
++	jwtSecret = []byte("test-secret")
++	cases := []struct {
++		name, body string
++		want       int
++	}{
++		{"right email and password", adminLogin, http.StatusOK},
++		{"email in another case and with spaces", `{"email":" Admin@Test.com ","password":"` + testAdminPassword + `"}`, http.StatusOK},
++		{"wrong password", `{"email":"admin@test.com","password":"guess"}`, http.StatusUnauthorized},
++		{"any other email", `{"email":"someone@test.com","password":"` + testAdminPassword + `"}`, http.StatusUnauthorized},
++		{"empty password", `{"email":"admin@test.com","password":""}`, http.StatusUnauthorized},
++	}
++	for _, c := range cases {
++		rec := httptest.NewRecorder()
++		handleLogin(rec, request("POST", "/auth/login", "203.0.113.30:1", c.body))
++		if rec.Code != c.want {
++			t.Errorf("%s: got %d, want %d", c.name, rec.Code, c.want)
++		}
++	}
++}
++
++func TestLoginTokenSaysAdmin(t *testing.T) {
++	setLimits(t, 1000, 1000, 1000, "")
++	jwtSecret = []byte("test-secret")
++	rec := httptest.NewRecorder()
++	handleLogin(rec, request("POST", "/auth/login", "203.0.113.31:1", adminLogin))
++	var body struct{ Token string }
++	_ = json.NewDecoder(rec.Body).Decode(&body)
++	claims := jwt.MapClaims{}
++	if _, err := jwt.ParseWithClaims(body.Token, claims, func(*jwt.Token) (interface{}, error) { return jwtSecret, nil }); err != nil {
++		t.Fatalf("token does not verify: %v", err)
++	}
++	if claims["sub"] != "admin@test.com" || claims["role"] != "admin" {
++		t.Fatalf("got sub=%v role=%v, want the admin account", claims["sub"], claims["role"])
++	}
++}
++
++func TestRegisterIsClosed(t *testing.T) {
++	setLimits(t, 1000, 1000, 1000, "")
++	rec := httptest.NewRecorder()
++	handleRegister(rec, request("POST", "/auth/register", "203.0.113.32:1", `{"email":"new@test.com","password":"x"}`))
++	if rec.Code != http.StatusForbidden {
++		t.Fatalf("register: got %d, want 403", rec.Code)
++	}
++	if rec.Header().Get("Content-Type") == "" || rec.Body.Len() == 0 {
++		t.Fatalf("register: want an error body")
++	}
++}
++
++// A client must not be able to tell a service who it is by sending the identity
++// headers itself, on a public route or on a logged-in one.
++func TestClientCannotSetIdentityHeaders(t *testing.T) {
++	setLimits(t, 1000, 1000, 1000, "")
++	var gotEmail, gotRole string
++	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		gotEmail, gotRole = r.Header.Get("X-User-Email"), r.Header.Get("X-User-Role")
++	}))
++	t.Cleanup(up.Close)
++	routes = map[string]string{"/api/orders": up.URL, "/api/shipping": up.URL}
++
++	r := request("POST", "/api/shipping/webhook", "203.0.113.33:1", `{}`)
++	r.Header.Set("X-User-Email", "boss@test.com")
++	r.Header.Set("X-User-Role", "admin")
++	handleProxy(httptest.NewRecorder(), r)
++	if gotEmail != "" || gotRole != "" {
++		t.Fatalf("public route forwarded client identity headers: email=%q role=%q", gotEmail, gotRole)
++	}
++
++	// A token with no role claim must not let a client-supplied role through.
++	tok, _ := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{"sub": "a@test.com", "exp": 9999999999}).SignedString(jwtSecret)
++	r = request("GET", "/api/orders/", "203.0.113.33:2", "")
++	r.Header.Set("Authorization", "Bearer "+tok)
++	r.Header.Set("X-User-Role", "admin")
++	handleProxy(httptest.NewRecorder(), r)
++	if gotEmail != "a@test.com" || gotRole != "" {
++		t.Fatalf("logged-in route: got email=%q role=%q, want the token's email and no role", gotEmail, gotRole)
++	}
++}
+diff --git a/services/api-gateway/edge_test.go b/services/api-gateway/edge_test.go
+new file mode 100644
+index 0000000..115b94f
+--- /dev/null
++++ b/services/api-gateway/edge_test.go
+@@ -0,0 +1,83 @@
++package main
++
++import (
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++)
++
++func TestEveryResponseCarriesSecurityHeaders(t *testing.T) {
++	setLimits(t, 1000, 1000, 1000, "")
++	fakeUpstream(t)
++	h := securityHeaders(http.HandlerFunc(handleProxy))
++	for _, path := range []string{"/api/orders/", "/healthz", "/no-such-route"} {
++		rec := httptest.NewRecorder()
++		h.ServeHTTP(rec, request("GET", path, "203.0.113.40:1", ""))
++		csp := rec.Header().Get("Content-Security-Policy")
++		if !strings.Contains(csp, "script-src 'self'") || strings.Contains(csp, "script-src 'self' 'unsafe-inline'") {
++			t.Errorf("%s: CSP %q must allow scripts from the page's own address only", path, csp)
++		}
++		if !strings.Contains(csp, "frame-ancestors 'none'") || rec.Header().Get("X-Content-Type-Options") != "nosniff" || rec.Header().Get("X-Frame-Options") != "DENY" {
++			t.Errorf("%s: missing frame or sniffing protection: %v", path, rec.Header())
++		}
++	}
++}
++
++// Requests with a bad token used to get a 401 without being counted at all.
++func TestBadTokensAreCountedAgainstTheIP(t *testing.T) {
++	useTestRedis(t)
++	fakeUpstream(t)
++	setLimits(t, 100, 2, 100, "")
++	codes := []int{}
++	for i := 0; i < 3; i++ {
++		r := request("GET", "/api/orders/", "203.0.113.41:1", "")
++		r.Header.Set("Authorization", "Bearer not-a-token")
++		rec := httptest.NewRecorder()
++		handleProxy(rec, r)
++		codes = append(codes, rec.Code)
++	}
++	if codes[0] != 401 || codes[1] != 401 || codes[2] != http.StatusTooManyRequests {
++		t.Fatalf("bad tokens from one IP: got %v, want [401 401 429]", codes)
++	}
++}
++
++// The upstream must see the client's IP in X-Forwarded-For, not Traefik's ip:port.
++func TestForwardedForKeepsTheClientChain(t *testing.T) {
++	setLimits(t, 1000, 1000, 1000, "10.0.0.0/8")
++	var got string
++	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { got = r.Header.Get("X-Forwarded-For") }))
++	t.Cleanup(up.Close)
++	routes = map[string]string{"/api/orders": up.URL}
++	r := request("GET", "/api/orders/", "10.6.1.20:51000", "") // Traefik pod
++	r.Header.Set("X-Forwarded-For", "198.51.100.7")            // what Traefik saw
++	r.Header.Set("Authorization", "Bearer "+tokenFor(t, "a@test.com"))
++	handleProxy(httptest.NewRecorder(), r)
++	if got != "198.51.100.7, 10.6.1.20" {
++		t.Fatalf("upstream X-Forwarded-For %q, want %q", got, "198.51.100.7, 10.6.1.20")
++	}
++}
++
++// The page's script must load without a token, like the page itself; data still needs one.
++func TestDashboardScriptIsServedWithoutAToken(t *testing.T) {
++	setLimits(t, 1000, 1000, 1000, "")
++	var paths []string
++	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { paths = append(paths, r.URL.Path) }))
++	t.Cleanup(up.Close)
++	routes = map[string]string{"/dashboard/": up.URL}
++	for _, p := range []string{"/", "/app.js"} {
++		rec := httptest.NewRecorder()
++		handleProxy(rec, request("GET", p, "203.0.113.42:1", ""))
++		if rec.Code != http.StatusOK {
++			t.Errorf("%s without a token: got %d, want 200", p, rec.Code)
++		}
++	}
++	rec := httptest.NewRecorder()
++	handleProxy(rec, request("GET", "/other.js", "203.0.113.42:2", ""))
++	if rec.Code != http.StatusUnauthorized {
++		t.Errorf("/other.js without a token: got %d, want 401", rec.Code)
++	}
++	if len(paths) != 2 || paths[1] != "/app.js" {
++		t.Errorf("upstream saw %v, want [/ /app.js]", paths)
++	}
++}
+diff --git a/services/api-gateway/main.go b/services/api-gateway/main.go
+index b302e34..11696c1 100644
+--- a/services/api-gateway/main.go
++++ b/services/api-gateway/main.go
+@@ -3,6 +3,7 @@ package main
+ import (
+ 	"context"
+ 	"crypto/sha256"
++	"crypto/subtle"
+ 	"encoding/hex"
+ 	"encoding/json"
+ 	"errors"
+@@ -33,8 +34,12 @@ var (
+ 	redisClient *redis.Client
+ 	ctx         = context.Background()
+ 	jwtSecret   []byte
+-	routes      map[string]string
+-	rlConfig    rateLimitConfig
++	adminEmail  string
++	adminDigest [32]byte // SHA-256 of the admin password; the password itself is not kept
++	// false when ADMIN_PASSWORD is missing: then nobody can log in
++	adminConfigured bool
++	routes          map[string]string
++	rlConfig        rateLimitConfig
+ )
+ 
+ func main() {
+@@ -45,6 +50,17 @@ func main() {
+ 	}
+ 	jwtSecret = []byte(secret)
+ 
++	// The dashboard has one admin account. The password comes from a secret (Secrets
++	// Manager on EKS), never from the code. Without it login refuses everyone, but the
++	// gateway still starts, so a secret that arrives late doesn't take the API down.
++	adminEmail = getEnv("ADMIN_EMAIL", "admin@platform.local")
++	if password := os.Getenv("ADMIN_PASSWORD"); password != "" {
++		adminDigest = sha256.Sum256([]byte(password))
++		adminConfigured = true
++	} else {
++		log.Println("WARNING: ADMIN_PASSWORD not set, every login is refused")
++	}
++
+ 	var err error
+ 	rlConfig, err = loadRateLimitConfig()
+ 	if err != nil {
+@@ -71,6 +87,11 @@ func main() {
+ 		if err != nil {
+ 			log.Fatalf("Invalid REDIS_URL: %v", err)
+ 		}
++		// The password is kept out of REDIS_URL so the URL can live in plain config
++		// and only the password comes from a secret.
++		if pw := os.Getenv("REDIS_PASSWORD"); pw != "" {
++			opt.Password = pw
++		}
+ 		redisClient = redis.NewClient(opt)
+ 		if _, err := redisClient.Ping(ctx).Result(); err != nil {
+ 			log.Printf("WARNING: Redis not reachable yet, rate limiting fails open until it is: %v", err)
+@@ -95,7 +116,7 @@ func main() {
+ 	port := getEnv("PORT", "8080")
+ 	server := &http.Server{
+ 		Addr:         ":" + port,
+-		Handler:      instrument(mux),
++		Handler:      securityHeaders(instrument(mux)),
+ 		ReadTimeout:  10 * time.Second,
+ 		WriteTimeout: 30 * time.Second,
+ 		IdleTimeout:  120 * time.Second,
+@@ -133,11 +154,15 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
+-	// In production this would validate against a user database
+-	// For this project, accept any email/password and return a JWT
++	if !isAdmin(req.Email, req.Password) {
++		// Same answer for a wrong email and a wrong password, so the email can't be guessed.
++		httpError(w, "invalid email or password", http.StatusUnauthorized)
++		return
++	}
++
+ 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+-		"sub":  req.Email,
+-		"role": "customer",
++		"sub":  adminEmail,
++		"role": "admin",
+ 		"exp":  time.Now().Add(24 * time.Hour).Unix(),
+ 		"iat":  time.Now().Unix(),
+ 	})
+@@ -152,6 +177,9 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
+ 	json.NewEncoder(w).Encode(map[string]string{"token": tokenString})
+ }
+ 
++// handleRegister is closed. The only user interface is the admin dashboard, and an
++// open register endpoint handed a valid token to anyone who asked for one.
++// Customer accounts need a user store with hashed passwords first (see the app docs).
+ func handleRegister(w http.ResponseWriter, r *http.Request) {
+ 	if r.Method != http.MethodPost {
+ 		httpError(w, "method not allowed", http.StatusMethodNotAllowed)
+@@ -160,47 +188,25 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
+ 	if rateLimited(w, r, scopeSensitive, clientIP(r), rlConfig.sensitiveLimit) {
+ 		return
+ 	}
++	httpError(w, "registration is closed", http.StatusForbidden)
++}
+ 
+-	var req struct {
+-		Email    string `json:"email"`
+-		Password string `json:"password"`
+-		Name     string `json:"name"`
+-	}
+-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+-		httpError(w, "invalid request body", http.StatusBadRequest)
+-		return
+-	}
+-
+-	if req.Email == "" || req.Password == "" {
+-		httpError(w, "email and password required", http.StatusBadRequest)
+-		return
+-	}
+-
+-	// Return a JWT for the new user
+-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+-		"sub":  req.Email,
+-		"name": req.Name,
+-		"role": "customer",
+-		"exp":  time.Now().Add(24 * time.Hour).Unix(),
+-		"iat":  time.Now().Unix(),
+-	})
+-
+-	tokenString, err := token.SignedString(jwtSecret)
+-	if err != nil {
+-		httpError(w, "failed to generate token", http.StatusInternalServerError)
+-		return
+-	}
+-
+-	w.Header().Set("Content-Type", "application/json")
+-	w.WriteHeader(http.StatusCreated)
+-	json.NewEncoder(w).Encode(map[string]interface{}{
+-		"message": "registered",
+-		"email":   req.Email,
+-		"token":   tokenString,
+-	})
++// isAdmin checks the login against the admin account. Both sides are hashed to the same
++// length and compared in constant time, so the response time says nothing about how
++// much of the password was right.
++func isAdmin(email, password string) bool {
++	given := sha256.Sum256([]byte(password))
++	emailOK := subtle.ConstantTimeCompare([]byte(strings.ToLower(strings.TrimSpace(email))), []byte(strings.ToLower(adminEmail))) == 1
++	passwordOK := subtle.ConstantTimeCompare(given[:], adminDigest[:]) == 1
++	return adminConfigured && emailOK && passwordOK
+ }
+ 
+ func handleProxy(w http.ResponseWriter, r *http.Request) {
++	// These headers tell services who is calling. Only the gateway may set them, from a
++	// checked token, so anything a client sent under these names is dropped first.
++	r.Header.Del("X-User-Email")
++	r.Header.Del("X-User-Role")
++
+ 	if isPublicPath(r.URL.Path) {
+ 		// Anonymous traffic is limited per client IP; sensitive routes (webhook) more strictly.
+ 		scope, limit := scopeIP, rlConfig.ipLimit
+@@ -213,6 +219,11 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
+ 	} else {
+ 		claims, err := validateToken(r)
+ 		if err != nil {
++			// A request without a valid token is still counted against its IP, so a client
++			// can't send unlimited requests just by sending a bad token.
++			if rateLimited(w, r, scopeIP, clientIP(r), rlConfig.ipLimit) {
++				return
++			}
+ 			httpError(w, "unauthorized: "+err.Error(), http.StatusUnauthorized)
+ 			return
+ 		}
+@@ -257,8 +268,8 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
+ 		}
+ 	}
+ 
+-	// The dashboard page itself, served by dashboard-api at "/".
+-	if r.URL.Path == "/" {
++	// The dashboard page and its script, served by dashboard-api.
++	if dashboardPageFiles[r.URL.Path] {
+ 		forward(w, r, routes["/dashboard/"])
+ 		return
+ 	}
+@@ -279,15 +290,20 @@ func forward(w http.ResponseWriter, r *http.Request, targetURL string) {
+ 		httpError(w, "service unavailable", http.StatusBadGateway)
+ 	}
+ 
+-	r.Header.Set("X-Forwarded-For", r.RemoteAddr)
++	// X-Forwarded-For is left to the reverse proxy, which appends the address that
++	// connected to us (without the port) to the chain Traefik sent. Setting it here
++	// replaced the client's IP with Traefik's ip:port.
+ 	r.Header.Set("X-Request-ID", fmt.Sprintf("%d", time.Now().UnixNano()))
+ 
+ 	proxy.ServeHTTP(w, r)
+ }
+ 
++// dashboardPageFiles are the files of the dashboard page itself. They hold no data,
++// so they are served without a token; the page's data calls still need one.
++var dashboardPageFiles = map[string]bool{"/": true, "/app.js": true}
++
+ func isPublicPath(path string) bool {
+-	// The dashboard page is static HTML; its data calls still need a token.
+-	if path == "/" {
++	if dashboardPageFiles[path] {
+ 		return true
+ 	}
+ 	public := []string{"/healthz", "/auth/", "/api/shipping/webhook"}
+@@ -537,9 +553,7 @@ func rateLimited(w http.ResponseWriter, r *http.Request, scope, id string, limit
+ 			secs = 1
+ 		}
+ 		w.Header().Set("Retry-After", strconv.Itoa(secs))
+-		limiterLog.Warn("rate limit exceeded",
+-			"scope", scope, "key", hashID(id), "limit", limit,
+-			"window_s", int(rlConfig.window.Seconds()), "retry_after_s", secs, "path", r.URL.Path)
++		logLimited(scope, hashID(id), limit, secs, r.URL.Path)
+ 		httpError(w, "rate limit exceeded", http.StatusTooManyRequests)
+ 		return true
+ 	default:
+@@ -575,6 +589,22 @@ func logLimiterFailure(scope string, err error) {
+ 		"scope", scope, "error", err.Error(), "suppressed_since_last_log", suppressedLimiterErrs.Swap(0))
+ }
+ 
++// logLimited logs a blocked request at most once per 10 s, with how many were not
++// logged, so a flood can't fill the logs. The metric still counts every one.
++func logLimited(scope, key string, limit int64, retryAfter int, path string) {
++	now := time.Now().Unix()
++	last := lastLimitedLog.Load()
++	if now-last < 10 || !lastLimitedLog.CompareAndSwap(last, now) {
++		suppressedLimited.Add(1)
++		return
++	}
++	limiterLog.Warn("rate limit exceeded",
++		"scope", scope, "key", key, "limit", limit, "window_s", int(rlConfig.window.Seconds()),
++		"retry_after_s", retryAfter, "path", path, "suppressed_since_last_log", suppressedLimited.Swap(0))
++}
++
++var lastLimitedLog, suppressedLimited atomic.Int64
++
+ // rateLimitDecisions counts every limiter decision. Alert on result="redis_error"
+ // (protection is off) and watch result="limited" per scope.
+ var rateLimitDecisions = prometheus.NewCounterVec(prometheus.CounterOpts{
+@@ -612,3 +642,23 @@ func gracefulShutdown(server *http.Server) {
+ 		server.Shutdown(ctx)
+ 	})
+ }
++
++// securityHeaders is added to every response, the dashboard page included.
++//
++// The Content-Security-Policy lets the page load scripts, data and images only from its
++// own address, so even if injected HTML got onto the page again it could not run a
++// script or send data elsewhere. The page has no inline scripts or onclick handlers
++// for that reason (static/app.js). Inline style attributes are still allowed.
++func securityHeaders(next http.Handler) http.Handler {
++	const csp = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; " +
++		"img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; " +
++		"form-action 'self'; frame-ancestors 'none'"
++	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		h := w.Header()
++		h.Set("Content-Security-Policy", csp)
++		h.Set("X-Content-Type-Options", "nosniff")
++		h.Set("X-Frame-Options", "DENY")
++		h.Set("Referrer-Policy", "no-referrer")
++		next.ServeHTTP(w, r)
++	})
++}
+diff --git a/services/api-gateway/main_test.go b/services/api-gateway/main_test.go
+index b504a71..e2133eb 100644
+--- a/services/api-gateway/main_test.go
++++ b/services/api-gateway/main_test.go
+@@ -163,12 +163,12 @@ func TestSensitiveRoutesAreLimitedPerIPWithStricterLimit(t *testing.T) {
+ 	fakeUpstream(t)
+ 	setLimits(t, 100, 100, 2, "")
+ 
+-	// Login: different emails and ports from one IP share the stricter budget.
++	// Login: different ports from one IP share the stricter budget.
+ 	codes := []int{}
+ 	for i := 1; i <= 3; i++ {
+ 		rec := httptest.NewRecorder()
+ 		handleLogin(rec, request("POST", "/auth/login", fmt.Sprintf("203.0.113.5:%d", 40000+i),
+-			fmt.Sprintf(`{"email":"user%d@test.com","password":"x"}`, i)))
++			fmt.Sprintf(`{"email":"admin@test.com","password":"%s"}`, testAdminPassword)))
+ 		codes = append(codes, rec.Code)
+ 	}
+ 	if codes[0] != 200 || codes[1] != 200 || codes[2] != http.StatusTooManyRequests {
+@@ -176,7 +176,7 @@ func TestSensitiveRoutesAreLimitedPerIPWithStricterLimit(t *testing.T) {
+ 	}
+ 	// A different IP is unaffected.
+ 	rec := httptest.NewRecorder()
+-	handleLogin(rec, request("POST", "/auth/login", "203.0.113.6:40000", `{"email":"x@test.com","password":"x"}`))
++	handleLogin(rec, request("POST", "/auth/login", "203.0.113.6:40000", adminLogin))
+ 	if rec.Code != http.StatusOK {
+ 		t.Fatalf("login from another IP: want 200, got %d", rec.Code)
+ 	}
+@@ -230,10 +230,10 @@ func TestCounterIsAtomicAndAlwaysHasExpiry(t *testing.T) {
+ func TestBlockedResponseHasRetryAfter(t *testing.T) {
+ 	useTestRedis(t)
+ 	setLimits(t, 100, 100, 1, "")
+-	handleLogin(httptest.NewRecorder(), request("POST", "/auth/login", "203.0.113.20:1", `{"email":"a@b.c","password":"x"}`))
++	handleLogin(httptest.NewRecorder(), request("POST", "/auth/login", "203.0.113.20:1", adminLogin))
+ 
+ 	rec := httptest.NewRecorder()
+-	handleLogin(rec, request("POST", "/auth/login", "203.0.113.20:2", `{"email":"a@b.c","password":"x"}`))
++	handleLogin(rec, request("POST", "/auth/login", "203.0.113.20:2", adminLogin))
+ 	if rec.Code != http.StatusTooManyRequests {
+ 		t.Fatalf("want 429, got %d", rec.Code)
+ 	}
+diff --git a/services/dashboard-api/health_test.go b/services/dashboard-api/health_test.go
+new file mode 100644
+index 0000000..5467da7
+--- /dev/null
++++ b/services/dashboard-api/health_test.go
+@@ -0,0 +1,38 @@
++package main
++
++import (
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"testing"
++)
++
++func TestBackgroundHealthReportsWhatTheServiceSays(t *testing.T) {
++	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
++	sick := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(503) }))
++	defer healthy.Close()
++	defer sick.Close()
++	down := sick.URL
++	sick.Close() // nothing listening any more
++
++	for _, c := range []struct {
++		name, url, want string
++		code            int
++	}{
++		{"healthy", healthy.URL, "ok", 200},
++		{"answers 503", func() string {
++			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(503) }))
++			t.Cleanup(s.Close)
++			return s.URL
++		}(), "unhealthy", 503},
++		{"not running", down, "unreachable", 503},
++	} {
++		rec := httptest.NewRecorder()
++		backgroundHealth("worker", c.url)(rec, httptest.NewRequest(http.MethodGet, "/dashboard/worker/healthz", nil))
++		var body map[string]string
++		json.NewDecoder(rec.Body).Decode(&body)
++		if rec.Code != c.code || body["status"] != c.want || body["service"] != "worker" {
++			t.Errorf("%s: got %d %v, want %d %s", c.name, rec.Code, body, c.code, c.want)
++		}
++	}
++}
+diff --git a/services/dashboard-api/main.go b/services/dashboard-api/main.go
+index fa0fb73..761644b 100644
+--- a/services/dashboard-api/main.go
++++ b/services/dashboard-api/main.go
+@@ -49,6 +49,10 @@ func main() {
+ 	mux.HandleFunc("/dashboard/revenue", handleRevenue)
+ 	mux.HandleFunc("/dashboard/inventory/alerts", handleInventoryAlerts)
+ 	mux.HandleFunc("/dashboard/shipping/overview", handleShippingOverview)
++	// The worker and scheduler take no traffic, so the page can't reach them. These two
++	// ask their health ports from inside the cluster and pass the answer on.
++	mux.HandleFunc("/dashboard/worker/healthz", backgroundHealth("worker", getEnv("WORKER_HEALTH_URL", "http://worker:8090/healthz")))
++	mux.HandleFunc("/dashboard/scheduler/healthz", backgroundHealth("scheduler", getEnv("SCHEDULER_HEALTH_URL", "http://scheduler:8091/healthz")))
+ 
+ 	// Serve frontend UI
+ 	staticFS, _ := fs.Sub(staticFiles, "static")
+@@ -92,6 +96,27 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
+ 	json.NewEncoder(w).Encode(map[string]string{"status": status, "service": "dashboard-api"})
+ }
+ 
++var healthClient = &http.Client{Timeout: 2 * time.Second}
++
++// backgroundHealth reports a background service's own /healthz: ok only when it answers 200.
++func backgroundHealth(name, url string) http.HandlerFunc {
++	return func(w http.ResponseWriter, r *http.Request) {
++		status, code := "ok", http.StatusOK
++		resp, err := healthClient.Get(url)
++		if err != nil {
++			status, code = "unreachable", http.StatusServiceUnavailable
++		} else {
++			resp.Body.Close()
++			if resp.StatusCode != http.StatusOK {
++				status, code = "unhealthy", http.StatusServiceUnavailable
++			}
++		}
++		w.Header().Set("Content-Type", "application/json")
++		w.WriteHeader(code)
++		json.NewEncoder(w).Encode(map[string]string{"status": status, "service": name})
++	}
++}
++
+ func handleSummary(w http.ResponseWriter, r *http.Request) {
+ 	today := time.Now().UTC().Truncate(24 * time.Hour)
+ 
+diff --git a/services/dashboard-api/static/app.js b/services/dashboard-api/static/app.js
+new file mode 100644
+index 0000000..754a35d
+--- /dev/null
++++ b/services/dashboard-api/static/app.js
+@@ -0,0 +1,361 @@
++const API = window.location.origin;
++// The token is kept in memory only, never in localStorage, so it is gone when the
++// tab closes. When it expires (24h) the API answers 401 and the login box comes back.
++let token = '';
++let refreshTimer = null;
++
++async function submitLogin(e) {
++    e.preventDefault();
++    const btn = document.getElementById('login-button');
++    btn.disabled = true;
++    try {
++        const r = await fetch(API + '/auth/login', {
++            method: 'POST',
++            headers: { 'Content-Type': 'application/json' },
++            body: JSON.stringify({
++                email: document.getElementById('login-email').value,
++                password: document.getElementById('login-password').value
++            })
++        });
++        const d = await r.json().catch(() => ({}));
++        if (!r.ok || !d.token) { toast(d.error || 'Login failed', true); return; }
++        token = d.token;
++        document.getElementById('login-password').value = '';
++        document.body.classList.remove('locked');
++        refreshAll();
++        if (!refreshTimer) refreshTimer = setInterval(refreshAll, 30000);
++    } catch (err) {
++        toast('Login failed', true);
++    } finally {
++        btn.disabled = false;
++    }
++}
++
++function showLogin() {
++    token = '';
++    document.body.classList.add('locked');
++}
++
++function headers() {
++    return { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token };
++}
++
++// Errors stay up longer than confirmations, and a new message restarts the clock
++// (before, an earlier message's timer could hide a newer one early).
++let toastTimer;
++function toast(msg, error) {
++    const t = document.getElementById('toast');
++    t.textContent = msg;
++    t.className = error ? 'error' : '';
++    t.style.display = 'block';
++    clearTimeout(toastTimer);
++    toastTimer = setTimeout(() => t.style.display = 'none', error ? 8000 : 4000);
++}
++
++function showTab(name, tabEl) {
++    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
++    document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
++    tabEl.classList.add('active');
++    document.getElementById('panel-' + name).classList.add('active');
++    refreshAll();
++}
++
++// Everything that comes back from the API is written into the page with innerHTML,
++// and some of it (the customer email, product ids, notes) is typed by whoever logged in.
++// esc() turns it into plain text first, so "<img onerror=...>" shows up as text
++// instead of running as code in the admin's browser.
++function esc(v) {
++    return String(v ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
++}
++
++function badge(status) {
++    return `<span class="badge badge-${esc(status)}">${esc(status)}</span>`;
++}
++
++function ts(s) {
++    if (!s) return '-';
++    return new Date(s).toLocaleString('en-GB', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' });
++}
++
++function money(n) { return '£' + Number(n || 0).toFixed(2); }
++
++// --- Stats ---
++async function loadStats() {
++    try {
++        const r = await fetch(API + '/dashboard/summary', { headers: headers() });
++        if (r.status === 401) { showLogin(); return; }
++        const d = await r.json();
++        document.getElementById('stats').innerHTML = `
++            <div class="card"><div class="card-label">Total Orders</div><div class="card-value blue">${esc(d.orders?.total || 0)}</div></div>
++            <div class="card"><div class="card-label">Today's Orders</div><div class="card-value green">${esc(d.orders?.today || 0)}</div></div>
++            <div class="card"><div class="card-label">Revenue</div><div class="card-value green">${money(d.revenue?.total)}</div></div>
++            <div class="card"><div class="card-label">Low Stock Alerts</div><div class="card-value ${d.inventory?.low_stock > 0 ? 'red' : 'green'}">${esc(d.inventory?.low_stock || 0)}</div></div>
++            <div class="card"><div class="card-label">Active Shipments</div><div class="card-value orange">${esc(d.shipping?.active_shipments || 0)}</div></div>
++        `;
++    } catch(e) { console.error('Stats error', e); }
++}
++
++// --- Orders ---
++async function loadOrders() {
++    try {
++        const r = await fetch(API + '/api/orders/', { headers: headers() });
++        const orders = await r.json();
++        const tbody = document.getElementById('orders-table');
++        if (!orders || !orders.length) { tbody.innerHTML = '<tr><td colspan="7" style="color:#8b949e">No orders yet</td></tr>'; return; }
++        tbody.innerHTML = orders.map(o => {
++            const items = (typeof o.items === 'string' ? JSON.parse(o.items) : o.items) || [];
++            const itemStr = items.map(i => `${esc(i.product_id)} x${esc(i.quantity)}`).join(', ');
++            let actions = '';
++            // No pending -> confirmed button: the worker confirms an order itself, after the payment
++            // has gone through. A manual confirm here would skip the payment.
++            const next = { confirmed: 'processing', processing: 'shipped', shipped: 'delivered' };
++            if (next[o.status]) {
++                actions = `<button class="btn btn-sm btn-blue" data-action="advance" data-id="${Number(o.id)}" data-status="${esc(next[o.status])}">${esc(next[o.status])}</button>`;
++            }
++            if (['pending','confirmed','processing'].includes(o.status)) {
++                actions += ` <button class="btn btn-sm btn-orange" data-action="advance" data-id="${Number(o.id)}" data-status="cancelled">cancel</button>`;
++            }
++            return `<tr><td>${esc(o.id)}</td><td>${esc(o.customer_id)}</td><td>${itemStr}</td><td>${money(o.total)}</td><td>${badge(o.status)}</td><td>${ts(o.created_at)}</td><td>${actions}</td></tr>`;
++        }).join('');
++    } catch(e) { console.error('Orders error', e); }
++}
++
++// Every order carries an Idempotency-Key. If the request gets no clear answer (timeout,
++// dropped connection) and the user clicks again with the same order, the same key is
++// sent, so the order-service returns the first order instead of making a second.
++// crypto.randomUUID() needs https, and dev is http, so build the key from getRandomValues.
++function newKey() {
++    return Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, '0')).join('');
++}
++let lastAttempt = null; // { body, key } of an order that got no clear answer
++let placingOrder = false;
++
++async function createOrder() {
++    if (placingOrder) return;
++    const product = document.getElementById('order-product').value;
++    const qty = parseInt(document.getElementById('order-qty').value) || 1;
++    if (!product) { toast('Pick a product', true); return; }
++
++    const order = { items: [{ product_id: product, quantity: qty }] };
++    // The address is sent when any part is filled in; order-service checks it is complete.
++    const addr = {
++        name: document.getElementById('ship-name').value,
++        line1: document.getElementById('ship-line1').value,
++        city: document.getElementById('ship-city').value,
++        postcode: document.getElementById('ship-postcode').value,
++        country: 'GB'
++    };
++    if (addr.name || addr.line1 || addr.city || addr.postcode) order.shipping_address = addr;
++    const body = JSON.stringify(order);
++    const key = lastAttempt && lastAttempt.body === body ? lastAttempt.key : newKey();
++    lastAttempt = { body, key };
++
++    const btn = document.getElementById('place-order');
++    placingOrder = true;
++    btn.disabled = true;
++    try {
++        const r = await fetch(API + '/api/orders/', {
++            method: 'POST', headers: { ...headers(), 'Idempotency-Key': key }, body
++        });
++        const d = await r.json();
++        if (r.ok) { lastAttempt = null; toast('Order #' + d.id + ' created'); refreshAll(); }
++        else {
++            if (r.status < 500) lastAttempt = null; // a clear "no": the next click is a new order
++            toast(d.error || 'Failed', true);
++        }
++    } catch(e) { toast('Error creating order', true); }
++    finally { placingOrder = false; btn.disabled = false; }
++}
++
++async function advanceOrder(id, status) {
++    try {
++        const r = await fetch(API + '/api/orders/status', {
++            method: 'PUT', headers: headers(),
++            body: JSON.stringify({ order_id: id, new_status: status })
++        });
++        if (r.ok) { toast(`Order #${id} -> ${status}`); refreshAll(); }
++        else { const d = await r.json(); toast(d.error || 'Failed', true); }
++    } catch(e) { toast('Error updating order', true); }
++}
++
++// --- Inventory ---
++// The order form only offers products that exist and have stock. The order-service
++// still checks every order, so this is a convenience, not the guard.
++function populateOrderProducts(products) {
++    const sel = document.getElementById('order-product');
++    const previous = sel.value;
++    sel.replaceChildren();
++    if (!products || !products.length) {
++        sel.add(new Option('No products yet', ''));
++        return;
++    }
++    products.forEach(p => {
++        const avail = p.available ?? (p.stock - p.reserved);
++        const opt = new Option(`${p.name} (${p.id}) - ${money(p.price)} - ${avail} available`, p.id);
++        opt.disabled = avail < 1;
++        sel.add(opt);
++    });
++    // The page refreshes every 30s; keep what the person already picked.
++    const keep = [...sel.options].find(o => o.value === previous && !o.disabled);
++    sel.value = keep ? previous : ([...sel.options].find(o => !o.disabled) || sel.options[0]).value;
++}
++
++async function loadInventory() {
++    try {
++        const r = await fetch(API + '/api/inventory/products', { headers: headers() });
++        const products = await r.json();
++        populateOrderProducts(products);
++        const tbody = document.getElementById('inventory-table');
++        if (!products || !products.length) { tbody.innerHTML = '<tr><td colspan="7" style="color:#8b949e">No products yet</td></tr>'; return; }
++        tbody.innerHTML = products.map(p => {
++            const avail = p.available ?? (p.stock - p.reserved);
++            const color = avail < 10 ? 'color:#f85149' : '';
++            return `<tr><td>${esc(p.id)}</td><td>${esc(p.name)}</td><td>${esc(p.sku)}</td><td>${money(p.price)}</td><td>${esc(p.stock)}</td><td>${esc(p.reserved)}</td><td style="${color}">${esc(avail)}</td></tr>`;
++        }).join('');
++    } catch(e) { console.error('Inventory error', e); }
++}
++
++async function addProduct() {
++    const data = {
++        id: document.getElementById('prod-id').value,
++        name: document.getElementById('prod-name').value,
++        sku: document.getElementById('prod-sku').value,
++        price: parseFloat(document.getElementById('prod-price').value) || 0,
++        stock: parseInt(document.getElementById('prod-stock').value) || 0
++    };
++    if (!data.id || !data.name) { toast('Fill in product details', true); return; }
++    try {
++        const r = await fetch(API + '/api/inventory/products', {
++            method: 'POST', headers: headers(),
++            body: JSON.stringify(data)
++        });
++        if (r.ok) { toast('Product added'); refreshAll(); }
++        else { const d = await r.json(); toast(d.error || 'Failed', true); }
++    } catch(e) { toast('Error adding product', true); }
++}
++
++// --- Payments ---
++async function loadPayments() {
++    try {
++        const r = await fetch(API + '/dashboard/revenue', { headers: headers() });
++        const d = await r.json();
++        document.getElementById('revenue-info').innerHTML = `
++            <div class="grid">
++                <div class="card"><div class="card-label">Charged</div><div class="card-value green">${money(d.total)}</div></div>
++                <div class="card"><div class="card-label">Refunded</div><div class="card-value red">${money(d.refunded)}</div></div>
++                <div class="card"><div class="card-label">Net</div><div class="card-value blue">${money(d.net)}</div></div>
++            </div>
++        `;
++    } catch(e) {}
++
++    try {
++        const r = await fetch(API + '/api/payments/ledger', { headers: headers() });
++        const entries = await r.json();
++        const tbody = document.getElementById('ledger-table');
++        if (!entries || !entries.length) { tbody.innerHTML = '<tr><td colspan="6" style="color:#8b949e">No entries</td></tr>'; return; }
++        tbody.innerHTML = entries.map(e => 
++            `<tr><td style="font-size:0.75rem">${esc(e.payment_id)}</td><td>${badge(e.entry_type)}</td><td>${e.debit > 0 ? money(e.debit) : '-'}</td><td>${e.credit > 0 ? money(e.credit) : '-'}</td><td>${esc(e.description)}</td><td>${ts(e.created_at)}</td></tr>`
++        ).join('');
++    } catch(e) {}
++}
++
++// --- Shipping ---
++async function loadShipping() {
++    try {
++        const r = await fetch(API + '/api/shipping/shipments', { headers: headers() });
++        const shipments = await r.json();
++        const tbody = document.getElementById('shipping-table');
++        if (!shipments || !shipments.length) { tbody.innerHTML = '<tr><td colspan="7" style="color:#8b949e">No shipments</td></tr>'; return; }
++        tbody.innerHTML = shipments.map(s =>
++            `<tr><td>${esc(s.id)}</td><td>${esc(s.order_id)}</td><td>${esc(s.carrier)}</td><td>${esc(s.tracking_number || '-')}</td><td>${badge(s.status)}</td><td>${esc(s.recipient_name)}</td><td>${esc(s.city)}</td></tr>`
++        ).join('');
++    } catch(e) {}
++
++    try {
++        const r = await fetch(API + '/dashboard/shipping/overview', { headers: headers() });
++        const d = await r.json();
++        const statuses = Object.entries(d.by_status || {}).map(([k,v]) => `${badge(k)} ${esc(v)}`).join('&nbsp;&nbsp;');
++        const carriers = Object.entries(d.by_carrier || {}).map(([k,v]) => `${esc(k)}: ${esc(v)}`).join(', ');
++        document.getElementById('shipping-overview').innerHTML = `
++            <p style="margin-bottom:8px">${statuses || 'No shipments'}</p>
++            <p style="color:#8b949e;font-size:0.85rem">Carriers: ${carriers || '-'} | Avg delivery: ${(Number(d.avg_delivery_hours) || 0).toFixed(1)}h</p>
++        `;
++    } catch(e) {}
++}
++
++// --- Notifications ---
++async function loadNotifications() {
++    try {
++        const r = await fetch(API + '/api/notifications/history', { headers: headers() });
++        const notifs = await r.json();
++        const tbody = document.getElementById('notif-table');
++        if (!notifs || !notifs.length) { tbody.innerHTML = '<tr><td colspan="6" style="color:#8b949e">No notifications</td></tr>'; return; }
++        tbody.innerHTML = notifs.map(n =>
++            `<tr><td>${esc(n.id)}</td><td>${esc(n.recipient)}</td><td>${esc(n.channel)}</td><td>${esc(n.template)}</td><td>${badge(n.status)}</td><td>${ts(n.sent_at || n.created_at)}</td></tr>`
++        ).join('');
++    } catch(e) {}
++}
++
++// --- Services ---
++async function loadServices() {
++    const services = [
++        { name: 'api-gateway', url: '/healthz' },
++        { name: 'order-service', url: '/api/orders/healthz' },
++        { name: 'inventory-service', url: '/api/inventory/healthz' },
++        { name: 'payment-service', url: '/api/payments/healthz' },
++        { name: 'notification-service', url: '/api/notifications/healthz' },
++        { name: 'shipping-service', url: '/api/shipping/healthz' },
++        { name: 'dashboard-api', url: '/dashboard/healthz' },
++        { name: 'worker', url: '/dashboard/worker/healthz' },
++        { name: 'scheduler', url: '/dashboard/scheduler/healthz' },
++    ];
++
++    const grid = document.getElementById('services-grid');
++    grid.innerHTML = services.map(s => 
++        `<div class="service-card" id="svc-${s.name}"><span class="service-name">${s.name}</span><span class="dot dot-grey"></span></div>`
++    ).join('');
++
++    for (const s of services) {
++        try {
++            const r = await fetch(API + s.url, { signal: AbortSignal.timeout(3000) });
++            const d = await r.json();
++            const el = document.getElementById('svc-' + s.name);
++            const dot = el.querySelector('.dot');
++            dot.className = d.status === 'ok' ? 'dot dot-green' : 'dot dot-red';
++        } catch(e) {
++            const el = document.getElementById('svc-' + s.name);
++            if (el) el.querySelector('.dot').className = 'dot dot-red';
++        }
++    }
++}
++
++// --- Refresh ---
++function refreshAll() {
++    if (!token) return;
++    loadStats();
++    loadOrders();
++    loadInventory();
++    loadPayments();
++    loadShipping();
++    loadNotifications();
++    loadServices();
++}
++
++// Data loads after login (see submitLogin). Auto-refresh is every 30s: all tabs of
++// one admin share one rate-limit bucket.
++
++// No inline handlers: the page's Content-Security-Policy only allows scripts from this
++// file, so clicks are wired up here instead of with onclick attributes.
++document.getElementById('login-box').addEventListener('submit', submitLogin);
++document.addEventListener('click', (e) => {
++    const tab = e.target.closest('[data-tab]');
++    if (tab) { showTab(tab.dataset.tab, tab); return; }
++    const el = e.target.closest('[data-action]');
++    if (!el) return;
++    switch (el.dataset.action) {
++        case 'refresh': refreshAll(); break;
++        case 'create-order': createOrder(); break;
++        case 'add-product': addProduct(); break;
++        case 'advance': advanceOrder(Number(el.dataset.id), el.dataset.status); break;
++    }
++});
+diff --git a/services/dashboard-api/static/index.html b/services/dashboard-api/static/index.html
+index fbd503e..da47cb3 100644
+--- a/services/dashboard-api/static/index.html
++++ b/services/dashboard-api/static/index.html
+@@ -67,21 +67,32 @@
+ 
+         #toast { position: fixed; bottom: 20px; right: 20px; padding: 12px 20px; border-radius: 6px; background: #238636; color: #fff; font-size: 0.85rem; display: none; z-index: 100; }
+         #toast.error { background: #f85149; }
++
++        /* Until someone logs in, only the login box is shown. */
++        #login-box { max-width: 360px; margin: 80px auto; display: none; }
++        body.locked #login-box { display: block; }
++        body.locked .container > :not(#login-box) { display: none; }
+     </style>
+ </head>
+-<body>
++<body class="locked">
+     <div class="container">
+-        <h1>Order Fulfillment Platform <span class="refresh" onclick="refreshAll()">refresh</span></h1>
++        <form id="login-box" class="section">
++            <h2>Admin login</h2>
++            <div class="form-row"><input type="email" id="login-email" placeholder="Email" autocomplete="username" required></div>
++            <div class="form-row"><input type="password" id="login-password" placeholder="Password" autocomplete="current-password" required></div>
++            <button class="btn btn-primary" type="submit" id="login-button">Log in</button>
++        </form>
++        <h1>Order Fulfillment Platform <span class="refresh" data-action="refresh">refresh</span></h1>
+ 
+         <div class="grid" id="stats"></div>
+ 
+         <div class="tabs">
+-            <div class="tab active" onclick="showTab('orders')">Orders</div>
+-            <div class="tab" onclick="showTab('inventory')">Inventory</div>
+-            <div class="tab" onclick="showTab('payments')">Payments</div>
+-            <div class="tab" onclick="showTab('shipping')">Shipping</div>
+-            <div class="tab" onclick="showTab('notifications')">Notifications</div>
+-            <div class="tab" onclick="showTab('services')">Services</div>
++            <div class="tab active" data-tab="orders">Orders</div>
++            <div class="tab" data-tab="inventory">Inventory</div>
++            <div class="tab" data-tab="payments">Payments</div>
++            <div class="tab" data-tab="shipping">Shipping</div>
++            <div class="tab" data-tab="notifications">Notifications</div>
++            <div class="tab" data-tab="services">Services</div>
+         </div>
+ 
+         <!-- Orders -->
+@@ -91,7 +102,13 @@
+                 <div class="form-row">
+                     <select id="order-product"><option value="">Loading products...</option></select>
+                     <input type="number" id="order-qty" placeholder="Qty" value="1" min="1" style="max-width:80px">
+-                    <button class="btn btn-primary" id="place-order" onclick="createOrder()">Place Order</button>
++                    <button class="btn btn-primary" id="place-order" data-action="create-order">Place Order</button>
++                </div>
++                <div class="form-row">
++                    <input type="text" id="ship-name" placeholder="Ship to: name" autocomplete="off">
++                    <input type="text" id="ship-line1" placeholder="Address line 1" autocomplete="off">
++                    <input type="text" id="ship-city" placeholder="City" autocomplete="off">
++                    <input type="text" id="ship-postcode" placeholder="Postcode" autocomplete="off" style="max-width:120px">
+                 </div>
+             </div>
+             <div class="section">
+@@ -113,7 +130,7 @@
+                     <input type="text" id="prod-sku" placeholder="SKU">
+                     <input type="number" id="prod-price" placeholder="Price" step="0.01" style="max-width:100px">
+                     <input type="number" id="prod-stock" placeholder="Stock" style="max-width:80px">
+-                    <button class="btn btn-primary" onclick="addProduct()">Add</button>
++                    <button class="btn btn-primary" data-action="add-product">Add</button>
+                 </div>
+             </div>
+             <div class="section">
+@@ -145,7 +162,7 @@
+             <div class="section">
+                 <h2>Shipments</h2>
+                 <table>
+-                    <thead><tr><th>ID</th><th>Order</th><th>Carrier</th><th>Tracking</th><th>Status</th><th>Recipient</th></tr></thead>
++                    <thead><tr><th>ID</th><th>Order</th><th>Carrier</th><th>Tracking</th><th>Status</th><th>Recipient</th><th>City</th></tr></thead>
+                     <tbody id="shipping-table"></tbody>
+                 </table>
+             </div>
+@@ -177,320 +194,6 @@
+ 
+     <div id="toast"></div>
+ 
+-    <script>
+-        const API = window.location.origin;
+-        let token = '';
+-
+-        // Tokens last 24h, so log in on every page load instead of reusing a stored one.
+-        function login() {
+-            return fetch(API + '/auth/login', {
+-                method: 'POST',
+-                headers: { 'Content-Type': 'application/json' },
+-                body: JSON.stringify({ email: 'admin@platform.local', password: 'admin' })
+-            })
+-            .then(r => r.json())
+-            .then(d => { token = d.token || ''; })
+-            .catch(() => {});
+-        }
+-
+-        function headers() {
+-            return { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token };
+-        }
+-
+-        // Errors stay up longer than confirmations, and a new message restarts the clock
+-        // (before, an earlier message's timer could hide a newer one early).
+-        let toastTimer;
+-        function toast(msg, error) {
+-            const t = document.getElementById('toast');
+-            t.textContent = msg;
+-            t.className = error ? 'error' : '';
+-            t.style.display = 'block';
+-            clearTimeout(toastTimer);
+-            toastTimer = setTimeout(() => t.style.display = 'none', error ? 8000 : 4000);
+-        }
+-
+-        function showTab(name) {
+-            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+-            document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+-            event.target.classList.add('active');
+-            document.getElementById('panel-' + name).classList.add('active');
+-            refreshAll();
+-        }
+-
+-        // Everything that comes back from the API is written into the page with innerHTML,
+-        // and some of it (the customer email, product ids, notes) is typed by whoever logged in.
+-        // esc() turns it into plain text first, so "<img onerror=...>" shows up as text
+-        // instead of running as code in the admin's browser.
+-        function esc(v) {
+-            return String(v ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+-        }
+-
+-        function badge(status) {
+-            return `<span class="badge badge-${esc(status)}">${esc(status)}</span>`;
+-        }
+-
+-        function ts(s) {
+-            if (!s) return '-';
+-            return new Date(s).toLocaleString('en-GB', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' });
+-        }
+-
+-        function money(n) { return '£' + Number(n || 0).toFixed(2); }
+-
+-        // --- Stats ---
+-        async function loadStats() {
+-            try {
+-                const r = await fetch(API + '/dashboard/summary', { headers: headers() });
+-                const d = await r.json();
+-                document.getElementById('stats').innerHTML = `
+-                    <div class="card"><div class="card-label">Total Orders</div><div class="card-value blue">${esc(d.orders?.total || 0)}</div></div>
+-                    <div class="card"><div class="card-label">Today's Orders</div><div class="card-value green">${esc(d.orders?.today || 0)}</div></div>
+-                    <div class="card"><div class="card-label">Revenue</div><div class="card-value green">${money(d.revenue?.total)}</div></div>
+-                    <div class="card"><div class="card-label">Low Stock Alerts</div><div class="card-value ${d.inventory?.low_stock > 0 ? 'red' : 'green'}">${esc(d.inventory?.low_stock || 0)}</div></div>
+-                    <div class="card"><div class="card-label">Active Shipments</div><div class="card-value orange">${esc(d.shipping?.active_shipments || 0)}</div></div>
+-                `;
+-            } catch(e) { console.error('Stats error', e); }
+-        }
+-
+-        // --- Orders ---
+-        async function loadOrders() {
+-            try {
+-                const r = await fetch(API + '/api/orders/', { headers: headers() });
+-                const orders = await r.json();
+-                const tbody = document.getElementById('orders-table');
+-                if (!orders || !orders.length) { tbody.innerHTML = '<tr><td colspan="7" style="color:#8b949e">No orders yet</td></tr>'; return; }
+-                tbody.innerHTML = orders.map(o => {
+-                    const items = (typeof o.items === 'string' ? JSON.parse(o.items) : o.items) || [];
+-                    const itemStr = items.map(i => `${esc(i.product_id)} x${esc(i.quantity)}`).join(', ');
+-                    let actions = '';
+-                    // No pending -> confirmed button: the worker confirms an order itself, after the payment
+-                    // has gone through. A manual confirm here would skip the payment.
+-                    const next = { confirmed: 'processing', processing: 'shipped', shipped: 'delivered' };
+-                    if (next[o.status]) {
+-                        actions = `<button class="btn btn-sm btn-blue" onclick="advanceOrder(${Number(o.id)},'${next[o.status]}')">${next[o.status]}</button>`;
+-                    }
+-                    if (['pending','confirmed','processing'].includes(o.status)) {
+-                        actions += ` <button class="btn btn-sm btn-orange" onclick="advanceOrder(${Number(o.id)},'cancelled')">cancel</button>`;
+-                    }
+-                    return `<tr><td>${esc(o.id)}</td><td>${esc(o.customer_id)}</td><td>${itemStr}</td><td>${money(o.total)}</td><td>${badge(o.status)}</td><td>${ts(o.created_at)}</td><td>${actions}</td></tr>`;
+-                }).join('');
+-            } catch(e) { console.error('Orders error', e); }
+-        }
+-
+-        // Every order carries an Idempotency-Key. If the request gets no clear answer (timeout,
+-        // dropped connection) and the user clicks again with the same order, the same key is
+-        // sent, so the order-service returns the first order instead of making a second.
+-        // crypto.randomUUID() needs https, and dev is http, so build the key from getRandomValues.
+-        function newKey() {
+-            return Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, '0')).join('');
+-        }
+-        let lastAttempt = null; // { body, key } of an order that got no clear answer
+-        let placingOrder = false;
+-
+-        async function createOrder() {
+-            if (placingOrder) return;
+-            const product = document.getElementById('order-product').value;
+-            const qty = parseInt(document.getElementById('order-qty').value) || 1;
+-            if (!product) { toast('Pick a product', true); return; }
+-
+-            const body = JSON.stringify({ items: [{ product_id: product, quantity: qty }] });
+-            const key = lastAttempt && lastAttempt.body === body ? lastAttempt.key : newKey();
+-            lastAttempt = { body, key };
+-
+-            const btn = document.getElementById('place-order');
+-            placingOrder = true;
+-            btn.disabled = true;
+-            try {
+-                const r = await fetch(API + '/api/orders/', {
+-                    method: 'POST', headers: { ...headers(), 'Idempotency-Key': key }, body
+-                });
+-                const d = await r.json();
+-                if (r.ok) { lastAttempt = null; toast('Order #' + d.id + ' created'); refreshAll(); }
+-                else {
+-                    if (r.status < 500) lastAttempt = null; // a clear "no": the next click is a new order
+-                    toast(d.error || 'Failed', true);
+-                }
+-            } catch(e) { toast('Error creating order', true); }
+-            finally { placingOrder = false; btn.disabled = false; }
+-        }
+-
+-        async function advanceOrder(id, status) {
+-            try {
+-                const r = await fetch(API + '/api/orders/status', {
+-                    method: 'PUT', headers: headers(),
+-                    body: JSON.stringify({ order_id: id, new_status: status })
+-                });
+-                if (r.ok) { toast(`Order #${id} -> ${status}`); refreshAll(); }
+-                else { const d = await r.json(); toast(d.error || 'Failed', true); }
+-            } catch(e) { toast('Error updating order', true); }
+-        }
+-
+-        // --- Inventory ---
+-        // The order form only offers products that exist and have stock. The order-service
+-        // still checks every order, so this is a convenience, not the guard.
+-        function populateOrderProducts(products) {
+-            const sel = document.getElementById('order-product');
+-            const previous = sel.value;
+-            sel.replaceChildren();
+-            if (!products || !products.length) {
+-                sel.add(new Option('No products yet', ''));
+-                return;
+-            }
+-            products.forEach(p => {
+-                const avail = p.available ?? (p.stock - p.reserved);
+-                const opt = new Option(`${p.name} (${p.id}) - ${money(p.price)} - ${avail} available`, p.id);
+-                opt.disabled = avail < 1;
+-                sel.add(opt);
+-            });
+-            // The page refreshes every 30s; keep what the person already picked.
+-            const keep = [...sel.options].find(o => o.value === previous && !o.disabled);
+-            sel.value = keep ? previous : ([...sel.options].find(o => !o.disabled) || sel.options[0]).value;
+-        }
+-
+-        async function loadInventory() {
+-            try {
+-                const r = await fetch(API + '/api/inventory/products', { headers: headers() });
+-                const products = await r.json();
+-                populateOrderProducts(products);
+-                const tbody = document.getElementById('inventory-table');
+-                if (!products || !products.length) { tbody.innerHTML = '<tr><td colspan="7" style="color:#8b949e">No products yet</td></tr>'; return; }
+-                tbody.innerHTML = products.map(p => {
+-                    const avail = p.available ?? (p.stock - p.reserved);
+-                    const color = avail < 10 ? 'color:#f85149' : '';
+-                    return `<tr><td>${esc(p.id)}</td><td>${esc(p.name)}</td><td>${esc(p.sku)}</td><td>${money(p.price)}</td><td>${esc(p.stock)}</td><td>${esc(p.reserved)}</td><td style="${color}">${esc(avail)}</td></tr>`;
+-                }).join('');
+-            } catch(e) { console.error('Inventory error', e); }
+-        }
+-
+-        async function addProduct() {
+-            const data = {
+-                id: document.getElementById('prod-id').value,
+-                name: document.getElementById('prod-name').value,
+-                sku: document.getElementById('prod-sku').value,
+-                price: parseFloat(document.getElementById('prod-price').value) || 0,
+-                stock: parseInt(document.getElementById('prod-stock').value) || 0
+-            };
+-            if (!data.id || !data.name) { toast('Fill in product details', true); return; }
+-            try {
+-                const r = await fetch(API + '/api/inventory/products', {
+-                    method: 'POST', headers: headers(),
+-                    body: JSON.stringify(data)
+-                });
+-                if (r.ok) { toast('Product added'); refreshAll(); }
+-                else { const d = await r.json(); toast(d.error || 'Failed', true); }
+-            } catch(e) { toast('Error adding product', true); }
+-        }
+-
+-        // --- Payments ---
+-        async function loadPayments() {
+-            try {
+-                const r = await fetch(API + '/dashboard/revenue', { headers: headers() });
+-                const d = await r.json();
+-                document.getElementById('revenue-info').innerHTML = `
+-                    <div class="grid">
+-                        <div class="card"><div class="card-label">Charged</div><div class="card-value green">${money(d.total)}</div></div>
+-                        <div class="card"><div class="card-label">Refunded</div><div class="card-value red">${money(d.refunded)}</div></div>
+-                        <div class="card"><div class="card-label">Net</div><div class="card-value blue">${money(d.net)}</div></div>
+-                    </div>
+-                `;
+-            } catch(e) {}
+-
+-            try {
+-                const r = await fetch(API + '/api/payments/ledger', { headers: headers() });
+-                const entries = await r.json();
+-                const tbody = document.getElementById('ledger-table');
+-                if (!entries || !entries.length) { tbody.innerHTML = '<tr><td colspan="6" style="color:#8b949e">No entries</td></tr>'; return; }
+-                tbody.innerHTML = entries.map(e => 
+-                    `<tr><td style="font-size:0.75rem">${esc(e.payment_id)}</td><td>${badge(e.entry_type)}</td><td>${e.debit > 0 ? money(e.debit) : '-'}</td><td>${e.credit > 0 ? money(e.credit) : '-'}</td><td>${esc(e.description)}</td><td>${ts(e.created_at)}</td></tr>`
+-                ).join('');
+-            } catch(e) {}
+-        }
+-
+-        // --- Shipping ---
+-        async function loadShipping() {
+-            try {
+-                const r = await fetch(API + '/api/shipping/shipments', { headers: headers() });
+-                const shipments = await r.json();
+-                const tbody = document.getElementById('shipping-table');
+-                if (!shipments || !shipments.length) { tbody.innerHTML = '<tr><td colspan="6" style="color:#8b949e">No shipments</td></tr>'; return; }
+-                tbody.innerHTML = shipments.map(s =>
+-                    `<tr><td>${esc(s.id)}</td><td>${esc(s.order_id)}</td><td>${esc(s.carrier)}</td><td>${esc(s.tracking_number || '-')}</td><td>${badge(s.status)}</td><td>${esc(s.recipient_name)}</td></tr>`
+-                ).join('');
+-            } catch(e) {}
+-
+-            try {
+-                const r = await fetch(API + '/dashboard/shipping/overview', { headers: headers() });
+-                const d = await r.json();
+-                const statuses = Object.entries(d.by_status || {}).map(([k,v]) => `${badge(k)} ${esc(v)}`).join('&nbsp;&nbsp;');
+-                const carriers = Object.entries(d.by_carrier || {}).map(([k,v]) => `${esc(k)}: ${esc(v)}`).join(', ');
+-                document.getElementById('shipping-overview').innerHTML = `
+-                    <p style="margin-bottom:8px">${statuses || 'No shipments'}</p>
+-                    <p style="color:#8b949e;font-size:0.85rem">Carriers: ${carriers || '-'} | Avg delivery: ${(Number(d.avg_delivery_hours) || 0).toFixed(1)}h</p>
+-                `;
+-            } catch(e) {}
+-        }
+-
+-        // --- Notifications ---
+-        async function loadNotifications() {
+-            try {
+-                const r = await fetch(API + '/api/notifications/history', { headers: headers() });
+-                const notifs = await r.json();
+-                const tbody = document.getElementById('notif-table');
+-                if (!notifs || !notifs.length) { tbody.innerHTML = '<tr><td colspan="6" style="color:#8b949e">No notifications</td></tr>'; return; }
+-                tbody.innerHTML = notifs.map(n =>
+-                    `<tr><td>${esc(n.id)}</td><td>${esc(n.recipient)}</td><td>${esc(n.channel)}</td><td>${esc(n.template)}</td><td>${badge(n.status)}</td><td>${ts(n.sent_at || n.created_at)}</td></tr>`
+-                ).join('');
+-            } catch(e) {}
+-        }
+-
+-        // --- Services ---
+-        async function loadServices() {
+-            const services = [
+-                { name: 'api-gateway', url: '/healthz' },
+-                { name: 'order-service', url: '/api/orders/healthz' },
+-                { name: 'inventory-service', url: '/api/inventory/healthz' },
+-                { name: 'payment-service', url: '/api/payments/healthz' },
+-                { name: 'notification-service', url: '/api/notifications/healthz' },
+-                { name: 'shipping-service', url: '/api/shipping/healthz' },
+-                { name: 'dashboard-api', url: '/dashboard/healthz' },
+-            ];
+-
+-            const grid = document.getElementById('services-grid');
+-            grid.innerHTML = services.map(s => 
+-                `<div class="service-card" id="svc-${s.name}"><span class="service-name">${s.name}</span><span class="dot dot-grey"></span></div>`
+-            ).join('');
+-
+-            for (const s of services) {
+-                try {
+-                    const r = await fetch(API + s.url, { signal: AbortSignal.timeout(3000) });
+-                    const d = await r.json();
+-                    const el = document.getElementById('svc-' + s.name);
+-                    const dot = el.querySelector('.dot');
+-                    dot.className = d.status === 'ok' ? 'dot dot-green' : 'dot dot-red';
+-                } catch(e) {
+-                    const el = document.getElementById('svc-' + s.name);
+-                    if (el) el.querySelector('.dot').className = 'dot dot-red';
+-                }
+-            }
+-        }
+-
+-        // --- Refresh ---
+-        function refreshAll() {
+-            loadStats();
+-            loadOrders();
+-            loadInventory();
+-            loadPayments();
+-            loadShipping();
+-            loadNotifications();
+-            loadServices();
+-        }
+-
+-        // Load data only once logged in. Auto-refresh every 30s: all tabs share one login,
+-        // so one rate-limit bucket. Log in again every hour so an open tab never expires.
+-        login().then(() => {
+-            refreshAll();
+-            setInterval(refreshAll, 30000);
+-        });
+-        setInterval(login, 60 * 60 * 1000);
+-    </script>
++    <script src="app.js"></script>
+ </body>
+ </html>
+diff --git a/services/order-service/address_test.go b/services/order-service/address_test.go
+new file mode 100644
+index 0000000..e26ee9e
+--- /dev/null
++++ b/services/order-service/address_test.go
+@@ -0,0 +1,110 @@
++package main
++
++import (
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"testing"
++)
++
++const addressBody = `{"items":[{"product_id":"p1","quantity":1}],
++	"shipping_address":{"name":" Sam Shopper ","line1":"1 High St","city":"Leeds","postcode":"LS1 1AA","country":"gb"}}`
++
++func getOrderJSON(t *testing.T, id int) Order {
++	t.Helper()
++	rec := httptest.NewRecorder()
++	handleOrders(rec, httptest.NewRequest(http.MethodGet, fmt.Sprintf("/%d", id), nil))
++	if rec.Code != http.StatusOK {
++		t.Fatalf("get order %d: %d %s", id, rec.Code, rec.Body)
++	}
++	var o Order
++	if err := json.Unmarshal(rec.Body.Bytes(), &o); err != nil {
++		t.Fatalf("decode order: %v", err)
++	}
++	return o
++}
++
++func TestOrderKeepsItsShippingAddress(t *testing.T) {
++	setupTestDB(t)
++	rec := postOrderWithKey(t, "addr-1", addressBody)
++	if rec.Code != http.StatusCreated {
++		t.Fatalf("create: %d %s", rec.Code, rec.Body)
++	}
++	o := getOrderJSON(t, orderIDFrom(t, rec.Body.Bytes()))
++	var a Address
++	if err := json.Unmarshal(o.ShippingAddress, &a); err != nil {
++		t.Fatalf("shipping_address missing or unreadable: %q", o.ShippingAddress)
++	}
++	want := Address{Name: "Sam Shopper", Line1: "1 High St", City: "Leeds", Postcode: "LS1 1AA", Country: "GB"}
++	if a != want {
++		t.Fatalf("got %+v, want %+v (trimmed, country upper-cased)", a, want)
++	}
++}
++
++func TestOrderWithoutAnAddressStillWorks(t *testing.T) {
++	setupTestDB(t)
++	rec := postOrder(t)
++	if rec.Code != http.StatusCreated {
++		t.Fatalf("create: %d %s", rec.Code, rec.Body)
++	}
++	if o := getOrderJSON(t, orderIDFrom(t, rec.Body.Bytes())); len(o.ShippingAddress) != 0 {
++		t.Fatalf("want no shipping_address, got %s", o.ShippingAddress)
++	}
++}
++
++func TestBadAddressIsRejectedAndSavesNothing(t *testing.T) {
++	setupTestDB(t)
++	bad := []string{
++		`{"name":"Sam","line1":"1 High St","postcode":"LS1 1AA"}`,                                // no city
++		`{"name":"","line1":"1 High St","city":"Leeds","postcode":"LS1 1AA"}`,                    // no name
++		`{"name":"Sam","line1":"1 High St","city":"Leeds","postcode":"LS1 1AA","country":"GBR"}`, // 3 letters
++		`{"name":"Sam","line1":"1 High St","city":"Leeds","postcode":"LS1 1AA","country":"G1"}`,  // not letters
++		fmt.Sprintf(`{"name":"Sam","line1":"1 High St","city":"Leeds","postcode":"%s"}`, "123456789012345678901"),
++	}
++	for i, a := range bad {
++		body := fmt.Sprintf(`{"items":[{"product_id":"p1","quantity":1}],"shipping_address":%s}`, a)
++		if rec := postOrderWithKey(t, fmt.Sprintf("bad-addr-%d", i), body); rec.Code != http.StatusBadRequest {
++			t.Errorf("address %s: got %d, want 400", a, rec.Code)
++		}
++	}
++	if n := count(t, `SELECT count(*) FROM orders`); n != 0 {
++		t.Fatalf("%d orders saved from bad addresses", n)
++	}
++}
++
++func TestSameKeyWithAnotherAddressIsRejected(t *testing.T) {
++	setupTestDB(t)
++	if rec := postOrderWithKey(t, "addr-2", addressBody); rec.Code != http.StatusCreated {
++		t.Fatalf("first: %d", rec.Code)
++	}
++	other := `{"items":[{"product_id":"p1","quantity":1}],
++		"shipping_address":{"name":"Sam Shopper","line1":"2 Other Rd","city":"Leeds","postcode":"LS1 1AA"}}`
++	if rec := postOrderWithKey(t, "addr-2", other); rec.Code != http.StatusUnprocessableEntity {
++		t.Fatalf("same key, new address: got %d, want 422", rec.Code)
++	}
++}
++
++// Keys stored before addresses existed must still match a retry without an address.
++func TestFingerprintWithoutAddressIsUnchanged(t *testing.T) {
++	items := []OrderItem{{ProductID: "p1", Quantity: 2}}
++	old := struct {
++		Items []struct {
++			ProductID string `json:"p"`
++			Quantity  int    `json:"q"`
++		} `json:"items"`
++		Currency string `json:"currency"`
++		Notes    string `json:"notes"`
++	}{Currency: "GBP", Notes: "n"}
++	old.Items = append(old.Items, struct {
++		ProductID string `json:"p"`
++		Quantity  int    `json:"q"`
++	}{"p1", 2})
++	b, _ := json.Marshal(old)
++	sum := sha256.Sum256(b)
++	if got := requestFingerprint(items, "GBP", "n", nil); got != hex.EncodeToString(sum[:]) {
++		t.Fatalf("fingerprint without an address changed")
++	}
++}
+diff --git a/services/order-service/idempotency.go b/services/order-service/idempotency.go
+index e05bd72..f91803b 100644
+--- a/services/order-service/idempotency.go
++++ b/services/order-service/idempotency.go
+@@ -27,16 +27,19 @@ const maxIdempotencyKeyLen = 255
+ // requestFingerprint is a hash of what the customer asked for (products, quantities,
+ // currency, notes). The client's own price is left out because it is ignored anyway.
+ // It lets us tell "the same request again" from "a different request reusing the key".
+-func requestFingerprint(items []OrderItem, currency, notes string) string {
++func requestFingerprint(items []OrderItem, currency, notes string, address *Address) string {
+ 	type line struct {
+ 		ProductID string `json:"p"`
+ 		Quantity  int    `json:"q"`
+ 	}
++	// The address is left out when there is none, so a request without one hashes
++	// exactly as it did before addresses existed (keys stored then still match).
+ 	canonical := struct {
+-		Items    []line `json:"items"`
+-		Currency string `json:"currency"`
+-		Notes    string `json:"notes"`
+-	}{Currency: currency, Notes: notes}
++		Items    []line   `json:"items"`
++		Currency string   `json:"currency"`
++		Notes    string   `json:"notes"`
++		Address  *Address `json:"address,omitempty"`
++	}{Currency: currency, Notes: notes, Address: address}
+ 	for _, it := range items {
+ 		canonical.Items = append(canonical.Items, line{it.ProductID, it.Quantity})
+ 	}
+diff --git a/services/order-service/main.go b/services/order-service/main.go
+index cb96bdd..efe8085 100644
+--- a/services/order-service/main.go
++++ b/services/order-service/main.go
+@@ -26,14 +26,50 @@ type Order struct {
+ 	Total      float64         `json:"total"`
+ 	Currency   string          `json:"currency"`
+ 	Notes      string          `json:"notes,omitempty"`
+-	CreatedAt  string          `json:"created_at"`
+-	UpdatedAt  string          `json:"updated_at"`
++	// Where the parcel goes. Empty for orders placed before addresses existed.
++	ShippingAddress json.RawMessage `json:"shipping_address,omitempty"`
++	CreatedAt       string          `json:"created_at"`
++	UpdatedAt       string          `json:"updated_at"`
+ }
+ 
+ type CreateOrderRequest struct {
+-	Items    []OrderItem `json:"items"`
+-	Currency string      `json:"currency"`
+-	Notes    string      `json:"notes,omitempty"`
++	Items           []OrderItem `json:"items"`
++	Currency        string      `json:"currency"`
++	Notes           string      `json:"notes,omitempty"`
++	ShippingAddress *Address    `json:"shipping_address,omitempty"`
++}
++
++// Address is where an order is shipped. The limits match the shipments table, so
++// anything accepted here also fits the shipment the worker creates from it.
++type Address struct {
++	Name     string `json:"name"`
++	Line1    string `json:"line1"`
++	Line2    string `json:"line2,omitempty"`
++	City     string `json:"city"`
++	Postcode string `json:"postcode"`
++	Country  string `json:"country"`
++}
++
++// validate trims the fields, fills the default country and says what is wrong, if anything.
++func (a *Address) validate() string {
++	for _, f := range []*string{&a.Name, &a.Line1, &a.Line2, &a.City, &a.Postcode, &a.Country} {
++		*f = strings.TrimSpace(*f)
++	}
++	if a.Country == "" {
++		a.Country = "GB"
++	}
++	a.Country = strings.ToUpper(a.Country)
++	switch {
++	case a.Name == "" || a.Line1 == "" || a.City == "" || a.Postcode == "":
++		return "shipping_address needs name, line1, city and postcode"
++	case len(a.Name) > 255 || len(a.Line1) > 255 || len(a.Line2) > 255:
++		return "shipping_address name and lines must be 255 characters or fewer"
++	case len(a.City) > 100 || len(a.Postcode) > 20:
++		return "shipping_address city must be 100 characters or fewer and postcode 20 or fewer"
++	case len(a.Country) != 2 || strings.Trim(a.Country, "ABCDEFGHIJKLMNOPQRSTUVWXYZ") != "":
++		return "shipping_address country must be a 2-letter code such as GB"
++	}
++	return ""
+ }
+ 
+ type OrderItem struct {
+@@ -147,6 +183,8 @@ func migrate() {
+ 			updated_at TIMESTAMP DEFAULT NOW()
+ 		)`,
+ 		`CREATE INDEX IF NOT EXISTS idx_orders_customer ON orders(customer_id)`,
++		// Added after launch, so older orders have none (NULL).
++		`ALTER TABLE orders ADD COLUMN IF NOT EXISTS shipping_address JSONB`,
+ 		`CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)`,
+ 		`CREATE TABLE IF NOT EXISTS order_events (
+ 			id SERIAL PRIMARY KEY,
+@@ -254,9 +292,19 @@ func createOrder(w http.ResponseWriter, r *http.Request) {
+ 		currency = "GBP"
+ 	}
+ 
++	var addressJSON interface{} // stays nil (SQL NULL) when no address was sent
++	if req.ShippingAddress != nil {
++		if msg := req.ShippingAddress.validate(); msg != "" {
++			httpError(w, msg, http.StatusBadRequest)
++			return
++		}
++		b, _ := json.Marshal(req.ShippingAddress)
++		addressJSON = string(b)
++	}
++
+ 	// A key we have already seen is answered from what we stored, before pricing, so a
+ 	// retry still works while inventory is down.
+-	fingerprint := requestFingerprint(req.Items, currency, req.Notes)
++	fingerprint := requestFingerprint(req.Items, currency, req.Notes, req.ShippingAddress)
+ 	if replayIfSeen(w, customerID, idemKey, fingerprint) {
+ 		return
+ 	}
+@@ -311,9 +359,9 @@ func createOrder(w http.ResponseWriter, r *http.Request) {
+ 
+ 	var orderID int
+ 	err = tx.QueryRow(
+-		`INSERT INTO orders (customer_id, status, items, total, currency, notes)
+-		 VALUES ($1, 'pending', $2, $3, $4, $5) RETURNING id`,
+-		customerID, itemsJSON, total, currency, req.Notes,
++		`INSERT INTO orders (customer_id, status, items, total, currency, notes, shipping_address)
++		 VALUES ($1, 'pending', $2, $3, $4, $5, $6) RETURNING id`,
++		customerID, itemsJSON, total, currency, req.Notes, addressJSON,
+ 	).Scan(&orderID)
+ 	if err != nil {
+ 		log.Printf("Create order error: %v", err)
+@@ -373,7 +421,7 @@ func listOrders(w http.ResponseWriter, r *http.Request) {
+ 	customerID := r.Header.Get("X-User-Email")
+ 	status := r.URL.Query().Get("status")
+ 
+-	query := "SELECT id, customer_id, status, items, total, currency, notes, created_at, updated_at FROM orders WHERE 1=1"
++	query := "SELECT id, customer_id, status, items, total, currency, notes, shipping_address, created_at, updated_at FROM orders WHERE 1=1"
+ 	args := []interface{}{}
+ 	argN := 1
+ 
+@@ -399,10 +447,12 @@ func listOrders(w http.ResponseWriter, r *http.Request) {
+ 	orders := []Order{}
+ 	for rows.Next() {
+ 		var o Order
+-		if err := rows.Scan(&o.ID, &o.CustomerID, &o.Status, &o.Items, &o.Total, &o.Currency, &o.Notes, &o.CreatedAt, &o.UpdatedAt); err != nil {
++		var addr []byte
++		if err := rows.Scan(&o.ID, &o.CustomerID, &o.Status, &o.Items, &o.Total, &o.Currency, &o.Notes, &addr, &o.CreatedAt, &o.UpdatedAt); err != nil {
+ 			httpError(w, "scan failed", http.StatusInternalServerError)
+ 			return
+ 		}
++		o.ShippingAddress = addr
+ 		orders = append(orders, o)
+ 	}
+ 	if err := rows.Err(); err != nil {
+@@ -416,10 +466,12 @@ func listOrders(w http.ResponseWriter, r *http.Request) {
+ 
+ func getOrder(w http.ResponseWriter, r *http.Request, id string) {
+ 	var o Order
++	var addr []byte
+ 	err := db.QueryRow(
+-		"SELECT id, customer_id, status, items, total, currency, notes, created_at, updated_at FROM orders WHERE id = $1",
++		"SELECT id, customer_id, status, items, total, currency, notes, shipping_address, created_at, updated_at FROM orders WHERE id = $1",
+ 		id,
+-	).Scan(&o.ID, &o.CustomerID, &o.Status, &o.Items, &o.Total, &o.Currency, &o.Notes, &o.CreatedAt, &o.UpdatedAt)
++	).Scan(&o.ID, &o.CustomerID, &o.Status, &o.Items, &o.Total, &o.Currency, &o.Notes, &addr, &o.CreatedAt, &o.UpdatedAt)
++	o.ShippingAddress = addr
+ 
+ 	if err != nil {
+ 		httpError(w, "order not found", http.StatusNotFound)
+diff --git a/services/payment-service/idempotency.go b/services/payment-service/idempotency.go
+new file mode 100644
+index 0000000..270981f
+--- /dev/null
++++ b/services/payment-service/idempotency.go
+@@ -0,0 +1,59 @@
++package main
++
++// Idempotency-Key on POST /charge.
++//
++// The database already allows one completed charge per order (ADR 0002). The key adds
++// what that rule can't: a retried charge gets back exactly the first answer, including a
++// decline. Without it, a charge that was declined could be sent again and approved on the
++// second try. The worker sends "charge-order-<id>", so every retry of one order's charge
++// uses the same key. Calls without a key keep working as before.
++
++import (
++	"crypto/sha256"
++	"database/sql"
++	"encoding/hex"
++	"errors"
++	"fmt"
++	"net/http"
++)
++
++const maxIdempotencyKeyLen = 255
++
++// chargeFingerprint identifies what was asked for, so a key reused for a different
++// charge is refused instead of answered with the wrong result.
++func chargeFingerprint(orderID int, customerID string, amount float64, currency, method string) string {
++	s := fmt.Sprintf("%d|%s|%.2f|%s|%s", orderID, customerID, amount, currency, method)
++	sum := sha256.Sum256([]byte(s))
++	return hex.EncodeToString(sum[:])
++}
++
++// replayCharge answers from a stored result when this key was used before. It returns
++// true when it has written a response, false when the key is new.
++func replayCharge(w http.ResponseWriter, key, fingerprint string) bool {
++	var hash string
++	var code sql.NullInt64
++	var body []byte
++	err := db.QueryRow(
++		`SELECT request_hash, status_code, response FROM payment_idempotency_keys WHERE key = $1`, key,
++	).Scan(&hash, &code, &body)
++	if errors.Is(err, sql.ErrNoRows) {
++		return false
++	}
++	if err != nil {
++		httpError(w, "idempotency lookup failed", http.StatusInternalServerError)
++		return true
++	}
++	if hash != fingerprint {
++		httpError(w, "Idempotency-Key was already used for a different charge", http.StatusUnprocessableEntity)
++		return true
++	}
++	if !code.Valid {
++		httpError(w, "a charge with this Idempotency-Key is still in progress; retry shortly", http.StatusConflict)
++		return true
++	}
++	w.Header().Set("Content-Type", "application/json")
++	w.Header().Set("Idempotent-Replayed", "true")
++	w.WriteHeader(int(code.Int64))
++	w.Write(body)
++	return true
++}
+diff --git a/services/payment-service/idempotency_test.go b/services/payment-service/idempotency_test.go
+new file mode 100644
+index 0000000..a27ae0e
+--- /dev/null
++++ b/services/payment-service/idempotency_test.go
+@@ -0,0 +1,117 @@
++package main
++
++import (
++	"bytes"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"reflect"
++	"sync"
++	"testing"
++)
++
++func chargeWithKey(t *testing.T, key string, orderID int, amount float64) *httptest.ResponseRecorder {
++	t.Helper()
++	body, _ := json.Marshal(map[string]interface{}{
++		"order_id": orderID, "customer_id": "c1", "amount": amount, "method": "card",
++	})
++	req := httptest.NewRequest(http.MethodPost, "/charge", bytes.NewReader(body))
++	if key != "" {
++		req.Header.Set("Idempotency-Key", key)
++	}
++	rec := httptest.NewRecorder()
++	handleCharge(rec, req)
++	return rec
++}
++
++// The bug the key closes: a declined charge sent again could be approved on the retry.
++func TestDeclinedChargeStaysDeclinedOnRetry(t *testing.T) {
++	setupTestDB(t)
++	processPayment = func() string { return "failed" }
++	first := chargeWithKey(t, "charge-order-7", 7, 20)
++	if first.Code != http.StatusPaymentRequired {
++		t.Fatalf("first: got %d, want 402", first.Code)
++	}
++	processPayment = func() string { return "completed" } // the provider would now approve
++	again := chargeWithKey(t, "charge-order-7", 7, 20)
++	if again.Code != http.StatusPaymentRequired || again.Header().Get("Idempotent-Replayed") != "true" {
++		t.Fatalf("retry: got %d replayed=%q, want the stored 402", again.Code, again.Header().Get("Idempotent-Replayed"))
++	}
++	if !sameJSON(t, first, again) {
++		t.Fatalf("retry body differs:\n%s\n%s", first.Body, again.Body)
++	}
++	if n := countPayments(t, 7, "completed"); n != 0 {
++		t.Fatalf("%d completed payments after a replayed decline, want 0", n)
++	}
++}
++
++func TestSuccessfulChargeIsReplayed(t *testing.T) {
++	setupTestDB(t)
++	first := chargeWithKey(t, "charge-order-8", 8, 20)
++	again := chargeWithKey(t, "charge-order-8", 8, 20)
++	if first.Code != http.StatusCreated || again.Code != http.StatusCreated || !sameJSON(t, first, again) {
++		t.Fatalf("got %d then %d, want the same 201 twice", first.Code, again.Code)
++	}
++	if n := countPayments(t, 8, "completed"); n != 1 {
++		t.Fatalf("%d completed payments, want 1", n)
++	}
++}
++
++func TestKeyReusedForAnotherChargeIsRefused(t *testing.T) {
++	setupTestDB(t)
++	chargeWithKey(t, "k1", 9, 20)
++	if rec := chargeWithKey(t, "k1", 9, 25); rec.Code != http.StatusUnprocessableEntity {
++		t.Fatalf("same key, other amount: got %d, want 422", rec.Code)
++	}
++}
++
++func TestConcurrentChargesWithOneKeyChargeOnce(t *testing.T) {
++	setupTestDB(t)
++	const n = 10
++	codes := make([]int, n)
++	var wg sync.WaitGroup
++	start := make(chan struct{})
++	for i := 0; i < n; i++ {
++		wg.Add(1)
++		go func(i int) {
++			defer wg.Done()
++			<-start
++			codes[i] = chargeWithKey(t, "charge-order-10", 10, 20).Code
++		}(i)
++	}
++	close(start)
++	wg.Wait()
++	for i, c := range codes {
++		// 201 (first or replayed), 200 (it saw the order already paid before the key
++		// was saved) or 409 (the first was still running): never a second charge.
++		if c != http.StatusCreated && c != http.StatusOK && c != http.StatusConflict {
++			t.Errorf("request %d: got %d, want 201, 200 or 409", i, c)
++		}
++	}
++	if got := countPayments(t, 10, "completed"); got != 1 {
++		t.Fatalf("%d completed payments, want 1", got)
++	}
++	var rows int
++	db.QueryRow(`SELECT count(*) FROM payments WHERE order_id = 10`).Scan(&rows)
++	if rows != 1 {
++		t.Fatalf("%d payment rows, want 1", rows)
++	}
++}
++
++func TestChargeWithoutAKeyStillWorks(t *testing.T) {
++	setupTestDB(t)
++	if rec := chargeWithKey(t, "", 11, 20); rec.Code != http.StatusCreated {
++		t.Fatalf("no key: got %d, want 201", rec.Code)
++	}
++}
++
++// sameJSON compares two responses as JSON (Postgres stores the saved answer as JSONB,
++// which may order the keys differently).
++func sameJSON(t *testing.T, a, b *httptest.ResponseRecorder) bool {
++	t.Helper()
++	var x, y map[string]interface{}
++	if json.Unmarshal(a.Body.Bytes(), &x) != nil || json.Unmarshal(b.Body.Bytes(), &y) != nil {
++		return false
++	}
++	return reflect.DeepEqual(x, y)
++}
+diff --git a/services/payment-service/main.go b/services/payment-service/main.go
+index 1b16542..d198cd5 100644
+--- a/services/payment-service/main.go
++++ b/services/payment-service/main.go
+@@ -109,6 +109,17 @@ func migrate() {
+ 			created_at TIMESTAMP DEFAULT NOW()
+ 		)`,
+ 		`CREATE INDEX IF NOT EXISTS idx_ledger_payment ON ledger_entries(payment_id)`,
++		// One row per Idempotency-Key on /charge: what was asked (hash) and what was answered.
++		// status_code and response stay NULL while the first request is still running.
++		`CREATE TABLE IF NOT EXISTS payment_idempotency_keys (
++			key VARCHAR(255) PRIMARY KEY,
++			request_hash CHAR(64) NOT NULL,
++			order_id INTEGER,
++			status_code INTEGER,
++			response JSONB,
++			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
++		)`,
++		`CREATE INDEX IF NOT EXISTS idx_payment_idempotency_keys_created ON payment_idempotency_keys(created_at)`,
+ 	}
+ 	for _, m := range migrations {
+ 		if _, err := db.Exec(m); err != nil {
+@@ -162,6 +173,17 @@ func handleCharge(w http.ResponseWriter, r *http.Request) {
+ 		currency = "GBP"
+ 	}
+ 
++	// A key seen before gets the first answer back, decline included.
++	key := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
++	if len(key) > maxIdempotencyKeyLen {
++		httpError(w, "Idempotency-Key is too long (255 characters at most)", http.StatusBadRequest)
++		return
++	}
++	fingerprint := chargeFingerprint(req.OrderID, req.CustomerID, req.Amount, currency, req.Method)
++	if key != "" && replayCharge(w, key, fingerprint) {
++		return
++	}
++
+ 	// Idempotent: an order that is already paid is never charged again.
+ 	if replyIfAlreadyPaid(w, req.OrderID, req.CustomerID, req.Amount, currency) {
+ 		return
+@@ -176,6 +198,25 @@ func handleCharge(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 	defer tx.Rollback()
+ 
++	// Claim the key in the same transaction as the payment. If another request holds it,
++	// this waits for that one to finish, then answers with its result.
++	if key != "" {
++		claim, err := tx.Exec(
++			`INSERT INTO payment_idempotency_keys (key, request_hash, order_id) VALUES ($1, $2, $3)
++			 ON CONFLICT (key) DO NOTHING`, key, fingerprint, req.OrderID)
++		if err != nil {
++			httpError(w, "failed to process payment", http.StatusInternalServerError)
++			return
++		}
++		if n, _ := claim.RowsAffected(); n == 0 {
++			tx.Rollback()
++			if !replayCharge(w, key, fingerprint) {
++				httpError(w, "a charge with this Idempotency-Key is still in progress; retry shortly", http.StatusConflict)
++			}
++			return
++		}
++	}
++
+ 	_, err = tx.Exec(
+ 		`INSERT INTO payments (id, order_id, customer_id, amount, currency, status, method)
+ 		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+@@ -208,6 +249,27 @@ func handleCharge(w http.ResponseWriter, r *http.Request) {
+ 		)
+ 	}
+ 
++	code := http.StatusCreated
++	if status == "failed" {
++		code = http.StatusPaymentRequired
++	}
++	resp, _ := json.Marshal(map[string]interface{}{
++		"payment_id": paymentID,
++		"order_id":   req.OrderID,
++		"amount":     req.Amount,
++		"currency":   currency,
++		"status":     status,
++	})
++	if key != "" {
++		if _, err := tx.Exec(
++			`UPDATE payment_idempotency_keys SET status_code = $2, response = $3 WHERE key = $1`,
++			key, code, string(resp),
++		); err != nil {
++			httpError(w, "failed to process payment", http.StatusInternalServerError)
++			return
++		}
++	}
++
+ 	if err := tx.Commit(); err != nil {
+ 		// Before this check the handler answered 201 and published payment.completed
+ 		// even when nothing was saved.
+@@ -225,20 +287,9 @@ func handleCharge(w http.ResponseWriter, r *http.Request) {
+ 		"status":      status,
+ 	})
+ 
+-	code := http.StatusCreated
+-	if status == "failed" {
+-		code = http.StatusPaymentRequired
+-	}
+-
+ 	w.Header().Set("Content-Type", "application/json")
+ 	w.WriteHeader(code)
+-	json.NewEncoder(w).Encode(map[string]interface{}{
+-		"payment_id": paymentID,
+-		"order_id":   req.OrderID,
+-		"amount":     req.Amount,
+-		"currency":   currency,
+-		"status":     status,
+-	})
++	w.Write(resp)
+ }
+ 
+ // processPayment simulates the payment provider (90% success rate).
+@@ -522,7 +573,10 @@ func publishEvent(eventType string, payload map[string]interface{}) {
+ 		"timestamp": time.Now().UTC().Format(time.RFC3339),
+ 	}
+ 	data, _ := json.Marshal(event)
+-	log.Printf("Event -> SQS: %s", string(data))
++	// Only logged. Nothing reads payment or shipment events today, so nothing is sent
++	// to SQS (the old "-> SQS" wording here was wrong). If a consumer is added, send
++	// them through an outbox like order events (ADR 0001).
++	log.Printf("Event (logged only): %s", string(data))
+ }
+ 
+ func httpError(w http.ResponseWriter, msg string, code int) {
+diff --git a/services/payment-service/main_test.go b/services/payment-service/main_test.go
+index 684f471..e701657 100644
+--- a/services/payment-service/main_test.go
++++ b/services/payment-service/main_test.go
+@@ -35,7 +35,7 @@ func setupTestDB(t *testing.T) {
+ 	}
+ 	warmPool(t, 20)
+ 	migrate()
+-	if _, err := db.Exec(`TRUNCATE ledger_entries, payments RESTART IDENTITY CASCADE`); err != nil {
++	if _, err := db.Exec(`TRUNCATE ledger_entries, payments, payment_idempotency_keys RESTART IDENTITY CASCADE`); err != nil {
+ 		t.Fatalf("truncate: %v", err)
+ 	}
+ 	// Make the simulated provider deterministic; tests that need a failure override it.
+diff --git a/services/scheduler/housekeeping_test.go b/services/scheduler/housekeeping_test.go
+index 67844e2..e1b71b5 100644
+--- a/services/scheduler/housekeeping_test.go
++++ b/services/scheduler/housekeeping_test.go
+@@ -5,6 +5,7 @@ package main
+ // owning service uses, so these tests also run on a database those services' own tests used.
+ 
+ import (
++	"fmt"
+ 	"sync"
+ 	"testing"
+ )
+@@ -60,6 +61,42 @@ func setupHousekeepingDB(t *testing.T) {
+ 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+ 			PRIMARY KEY (customer_id, key)
+ 		)`,
++		`CREATE TABLE IF NOT EXISTS payment_idempotency_keys (
++			key VARCHAR(255) PRIMARY KEY,
++			request_hash CHAR(64) NOT NULL,
++			order_id INTEGER,
++			status_code INTEGER,
++			response JSONB,
++			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
++		)`,
++		`CREATE TABLE IF NOT EXISTS shipments (
++			id SERIAL PRIMARY KEY,
++			order_id INTEGER NOT NULL,
++			carrier VARCHAR(50) NOT NULL,
++			tracking_number VARCHAR(100) UNIQUE,
++			status VARCHAR(30) NOT NULL DEFAULT 'label_created',
++			recipient_name VARCHAR(255),
++			address_line1 TEXT,
++			address_line2 TEXT,
++			city VARCHAR(100),
++			postcode VARCHAR(20),
++			country VARCHAR(2) DEFAULT 'GB',
++			weight_kg DECIMAL(8,2),
++			estimated_delivery DATE,
++			shipped_at TIMESTAMP,
++			delivered_at TIMESTAMP,
++			created_at TIMESTAMP DEFAULT NOW(),
++			updated_at TIMESTAMP DEFAULT NOW()
++		)`,
++		`CREATE TABLE IF NOT EXISTS tracking_events (
++			id SERIAL PRIMARY KEY,
++			shipment_id INTEGER NOT NULL REFERENCES shipments(id),
++			status VARCHAR(30) NOT NULL,
++			location VARCHAR(255),
++			description TEXT,
++			occurred_at TIMESTAMP NOT NULL,
++			created_at TIMESTAMP DEFAULT NOW()
++		)`,
+ 		`CREATE TABLE IF NOT EXISTS notifications (
+ 			id SERIAL PRIMARY KEY,
+ 			recipient VARCHAR(255) NOT NULL,
+@@ -78,7 +115,7 @@ func setupHousekeepingDB(t *testing.T) {
+ 			t.Fatalf("create table: %v\n%s", err, q)
+ 		}
+ 	}
+-	if _, err := db.Exec(`TRUNCATE order_outbox, notifications, reservations, products RESTART IDENTITY CASCADE`); err != nil {
++	if _, err := db.Exec(`TRUNCATE order_outbox, notifications, tracking_events, shipments, reservations, products RESTART IDENTITY CASCADE`); err != nil {
+ 		t.Fatalf("truncate: %v", err)
+ 	}
+ }
+@@ -284,6 +321,9 @@ func TestRetentionDeletesOldRowsAndKeepsRecentOnes(t *testing.T) {
+ 	mustExec(t, `UPDATE order_outbox SET created_at = NOW() - interval '30 days' WHERE event_type = 'unsent-old'`)
+ 	mustExec(t, `INSERT INTO idempotency_keys (customer_id, key, request_hash, order_id, created_at) VALUES
+ 		('a', 'old', 'h', $1, NOW() - interval '25 hours'), ('a', 'new', 'h', $1, NOW() - interval '23 hours')`, id)
++	mustExec(t, `TRUNCATE payment_idempotency_keys`)
++	mustExec(t, `INSERT INTO payment_idempotency_keys (key, request_hash, created_at) VALUES
++		('old', 'h', NOW() - interval '15 days'), ('new', 'h', NOW() - interval '13 days')`)
+ 	mustExec(t, `INSERT INTO notifications (recipient, channel, template, body, created_at) VALUES
+ 		('a', 'email', 't', 'b', NOW() - interval '91 days'), ('a', 'email', 't', 'b', NOW() - interval '89 days')`)
+ 
+@@ -301,6 +341,8 @@ func TestRetentionDeletesOldRowsAndKeepsRecentOnes(t *testing.T) {
+ 		{"idempotency keys kept", `SELECT count(*) FROM idempotency_keys WHERE key = 'new'`, 1},
+ 		{"old idempotency key deleted", `SELECT count(*) FROM idempotency_keys WHERE key = 'old'`, 0},
+ 		{"notifications kept", `SELECT count(*) FROM notifications`, 1},
++		{"charge key kept", `SELECT count(*) FROM payment_idempotency_keys WHERE key = 'new'`, 1},
++		{"old charge key deleted", `SELECT count(*) FROM payment_idempotency_keys WHERE key = 'old'`, 0},
+ 	}
+ 	for _, c := range checks {
+ 		if got := countRows(t, c.query); got != c.want {
+@@ -328,3 +370,38 @@ func mustExec(t *testing.T, q string, args ...interface{}) {
+ 		t.Fatalf("exec: %v\n%s", err, q)
+ 	}
+ }
++
++func TestRetentionClearsFinishedShipmentDetailsButKeepsTheShipment(t *testing.T) {
++	setupHousekeepingDB(t)
++	add := func(order int, status string, daysAgo int) int {
++		var id int
++		err := db.QueryRow(`INSERT INTO shipments (order_id, carrier, tracking_number, status, recipient_name, address_line1, postcode, updated_at)
++			VALUES ($1, 'royal_mail', $2, $3, 'Sam Shopper', '1 High St', 'AB1 2CD', NOW() - make_interval(days => $4)) RETURNING id`,
++			order, fmt.Sprintf("TRK%d", order), status, daysAgo).Scan(&id)
++		if err != nil {
++			t.Fatalf("insert shipment: %v", err)
++		}
++		mustExec(t, `INSERT INTO tracking_events (shipment_id, status, occurred_at) VALUES ($1, $2, NOW())`, id, status)
++		return id
++	}
++	oldDelivered := add(1, "delivered", 91)
++	recentDelivered := add(2, "delivered", 89)
++	oldMoving := add(3, "in_transit", 200) // still moving: the carrier may still need the address
++
++	cleanupOldEvents()
++
++	details := func(id int) int {
++		return countRows(t, `SELECT count(*) FROM shipments WHERE id = $1 AND recipient_name IS NOT NULL AND address_line1 IS NOT NULL AND postcode IS NOT NULL`, id)
++	}
++	if countRows(t, `SELECT count(*) FROM shipments`) != 3 {
++		t.Fatalf("shipments must never be deleted")
++	}
++	if details(oldDelivered) != 0 || countRows(t, `SELECT count(*) FROM tracking_events WHERE shipment_id = $1`, oldDelivered) != 0 {
++		t.Errorf("shipment delivered 91 days ago still has its name, address or tracking steps")
++	}
++	for _, id := range []int{recentDelivered, oldMoving} {
++		if details(id) != 1 || countRows(t, `SELECT count(*) FROM tracking_events WHERE shipment_id = $1`, id) != 1 {
++			t.Errorf("shipment %d lost its details too early", id)
++		}
++	}
++}
+diff --git a/services/scheduler/retention.go b/services/scheduler/retention.go
+index 3a12a91..a72fcd6 100644
+--- a/services/scheduler/retention.go
++++ b/services/scheduler/retention.go
+@@ -16,7 +16,7 @@ import (
+ 
+ type retentionRule struct {
+ 	table string
+-	// sql must delete the old rows and take the age in seconds as $1.
++	// sql must remove (or blank) the old rows and take the age in seconds as $1.
+ 	sql string
+ 	age time.Duration
+ }
+@@ -28,7 +28,18 @@ var retentionRules = []retentionRule{
+ 	{"order_outbox", `DELETE FROM order_outbox WHERE sent_at IS NOT NULL AND sent_at < NOW() - make_interval(secs => $1)`, 7 * 24 * time.Hour},
+ 	// A retry after 24 hours is a new attempt, not a retry of the old one.
+ 	{"idempotency_keys", `DELETE FROM idempotency_keys WHERE created_at < NOW() - make_interval(secs => $1)`, 24 * time.Hour},
++	// Kept as long as a message can wait in the DLQ (14 days), so a redriven charge still
++	// gets its first answer back.
++	{"payment_idempotency_keys", `DELETE FROM payment_idempotency_keys WHERE created_at < NOW() - make_interval(secs => $1)`, 14 * 24 * time.Hour},
+ 	{"notifications", `DELETE FROM notifications WHERE created_at < NOW() - make_interval(secs => $1)`, 90 * 24 * time.Hour},
++	// A shipment stays as long as its order, because it is part of the order's history.
++	// Its tracking steps and the customer's name and address are only needed while the
++	// parcel is moving, so 90 days after a shipment is finished they are removed.
++	{"tracking_events", `DELETE FROM tracking_events WHERE shipment_id IN (
++		SELECT id FROM shipments WHERE status IN ('delivered', 'cancelled') AND updated_at < NOW() - make_interval(secs => $1))`, 90 * 24 * time.Hour},
++	{"shipments (name and address)", `UPDATE shipments SET recipient_name = NULL, address_line1 = NULL, address_line2 = NULL, postcode = NULL
++		WHERE status IN ('delivered', 'cancelled') AND updated_at < NOW() - make_interval(secs => $1)
++		AND (recipient_name IS NOT NULL OR address_line1 IS NOT NULL OR address_line2 IS NOT NULL OR postcode IS NOT NULL)`, 90 * 24 * time.Hour},
+ }
+ 
+ // pruneOldRows applies every rule. A failing rule (for example a table its owning service
+@@ -41,7 +52,7 @@ func pruneOldRows(conn *sql.DB, rules []retentionRule) {
+ 			continue
+ 		}
+ 		if n, _ := res.RowsAffected(); n > 0 {
+-			log.Printf("retention: deleted %d rows from %s older than %s", n, r.table, r.age)
++			log.Printf("retention: cleaned %d rows in %s older than %s", n, r.table, r.age)
+ 		}
+ 	}
+ }
+diff --git a/services/shipping-service/main.go b/services/shipping-service/main.go
+index 508010c..b5371be 100644
+--- a/services/shipping-service/main.go
++++ b/services/shipping-service/main.go
+@@ -2,9 +2,13 @@ package main
+ 
+ import (
+ 	"context"
++	"crypto/hmac"
++	"crypto/sha256"
+ 	"database/sql"
++	"encoding/hex"
+ 	"encoding/json"
+ 	"fmt"
++	"io"
+ 	"log"
+ 	"math/rand"
+ 	"net/http"
+@@ -39,6 +43,13 @@ func main() {
+ 	waitForDB()
+ 	migrate()
+ 
++	// The carrier signs every webhook call with this shared secret (see verifyCarrierSignature).
++	// Without it the webhook refuses every call rather than trusting anyone.
++	webhookSecret = []byte(os.Getenv("CARRIER_WEBHOOK_SECRET"))
++	if len(webhookSecret) == 0 {
++		log.Println("WARNING: CARRIER_WEBHOOK_SECRET not set, the carrier webhook refuses every call")
++	}
++
+     startMetricsServer(getEnv("METRICS_PORT", "9090"))  
+ 	mux := http.NewServeMux()
+ 	mux.HandleFunc("/livez", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
+@@ -533,13 +544,29 @@ func handleCarrierWebhook(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
++	// The signature covers the exact bytes sent, so read the body once and check it
++	// before parsing anything.
++	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 64<<10))
++	if err != nil {
++		httpError(w, "invalid request body", http.StatusBadRequest)
++		return
++	}
++	if len(webhookSecret) == 0 {
++		httpError(w, "webhook not configured", http.StatusServiceUnavailable)
++		return
++	}
++	if !verifyCarrierSignature(r.Header.Get("X-Carrier-Signature"), body) {
++		httpError(w, "invalid signature", http.StatusUnauthorized)
++		return
++	}
++
+ 	var req struct {
+ 		TrackingNumber string `json:"tracking_number"`
+ 		Status         string `json:"status"`
+ 		Location       string `json:"location"`
+ 		Description    string `json:"description"`
+ 	}
+-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
++	if err := json.Unmarshal(body, &req); err != nil {
+ 		httpError(w, "invalid request body", http.StatusBadRequest)
+ 		return
+ 	}
+@@ -556,7 +583,7 @@ func handleCarrierWebhook(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 
+ 	var orderID int
+-	err := db.QueryRow(
++	err = db.QueryRow(
+ 		"SELECT order_id FROM shipments WHERE tracking_number = $1",
+ 		req.TrackingNumber,
+ 	).Scan(&orderID)
+@@ -602,7 +629,10 @@ func publishEvent(eventType string, payload map[string]interface{}) {
+ 		"timestamp": time.Now().UTC().Format(time.RFC3339),
+ 	}
+ 	data, _ := json.Marshal(event)
+-	log.Printf("Event -> SQS: %s", string(data))
++	// Only logged. Nothing reads payment or shipment events today, so nothing is sent
++	// to SQS (the old "-> SQS" wording here was wrong). If a consumer is added, send
++	// them through an outbox like order events (ADR 0001).
++	log.Printf("Event (logged only): %s", string(data))
+ }
+ 
+ func httpError(w http.ResponseWriter, msg string, code int) {
+@@ -628,3 +658,27 @@ func waitForDB() {
+ 	}
+ 	log.Fatal("Database not ready after 120s")
+ }
++
++// webhookSecret is shared with the carrier. Only someone holding it can sign a call.
++var webhookSecret []byte
++
++// verifyCarrierSignature checks the X-Carrier-Signature header, "sha256=" followed by the
++// hex HMAC-SHA256 of the raw body keyed with the shared secret (the same scheme GitHub
++// uses for its webhooks). hmac.Equal compares in constant time, so a caller can't learn
++// the right signature byte by byte from response times.
++//
++// There is no timestamp in the signature, so a captured call could be sent again. That is
++// harmless here: a shipment only ever moves forward and a repeat changes nothing.
++func verifyCarrierSignature(header string, body []byte) bool {
++	got, ok := strings.CutPrefix(header, "sha256=")
++	if !ok {
++		return false
++	}
++	sig, err := hex.DecodeString(got)
++	if err != nil {
++		return false
++	}
++	mac := hmac.New(sha256.New, webhookSecret)
++	mac.Write(body)
++	return hmac.Equal(sig, mac.Sum(nil))
++}
+diff --git a/services/shipping-service/main_test.go b/services/shipping-service/main_test.go
+index 9ad122b..55e5b40 100644
+--- a/services/shipping-service/main_test.go
++++ b/services/shipping-service/main_test.go
+@@ -10,12 +10,17 @@ package main
+ 
+ import (
+ 	"bytes"
++	"crypto/hmac"
++	"crypto/sha256"
+ 	"database/sql"
++	"encoding/hex"
+ 	"encoding/json"
++	"fmt"
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"os"
+ 	"strconv"
++	"strings"
+ 	"sync"
+ 	"testing"
+ )
+@@ -250,10 +255,29 @@ func TestConcurrentMovesRecordOneEvent(t *testing.T) {
+ 
+ // --- Carrier webhook (open to the internet through the gateway) ---
+ 
++const testWebhookSecret = "test-carrier-secret"
++
++func sign(secret, body string) string {
++	mac := hmac.New(sha256.New, []byte(secret))
++	mac.Write([]byte(body))
++	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
++}
++
++// webhook sends a call signed the way the carrier signs it.
+ func webhook(t *testing.T, body string) (int, map[string]interface{}) {
+ 	t.Helper()
++	return webhookWithSignature(t, body, sign(testWebhookSecret, body))
++}
++
++func webhookWithSignature(t *testing.T, body, signature string) (int, map[string]interface{}) {
++	t.Helper()
++	webhookSecret = []byte(testWebhookSecret)
+ 	rec := httptest.NewRecorder()
+-	handleCarrierWebhook(rec, httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewBufferString(body)))
++	req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewBufferString(body))
++	if signature != "" {
++		req.Header.Set("X-Carrier-Signature", signature)
++	}
++	handleCarrierWebhook(rec, req)
+ 	var resp map[string]interface{}
+ 	json.NewDecoder(rec.Body).Decode(&resp)
+ 	return rec.Code, resp
+@@ -348,3 +372,54 @@ func TestWebhookIsSafeToRepeatAndNeverMovesBackwards(t *testing.T) {
+ 		t.Errorf("a cancelled shipment became %s", s)
+ 	}
+ }
++
++func TestWebhookOnlyAcceptsCallsSignedWithTheSharedSecret(t *testing.T) {
++	setupTestDB(t)
++	createFor(t, 42)
++	body := fmt.Sprintf(`{"tracking_number":%q,"status":"in_transit"}`, trackingOf(t, 42))
++	tampered := strings.Replace(body, "in_transit", "delivered", 1)
++
++	cases := []struct {
++		name, body, signature string
++	}{
++		{"no signature", body, ""},
++		{"signed with another secret", body, sign("not-the-secret", body)},
++		{"body changed after signing", tampered, sign(testWebhookSecret, body)},
++		{"signature without the sha256= prefix", body, strings.TrimPrefix(sign(testWebhookSecret, body), "sha256=")},
++		{"signature that is not hex", body, "sha256=zz"},
++	}
++	for _, c := range cases {
++		if code, _ := webhookWithSignature(t, c.body, c.signature); code != http.StatusUnauthorized {
++			t.Errorf("%s: got %d, want 401", c.name, code)
++		}
++	}
++	if s := shipmentStatus(t, 42); s != "label_created" {
++		t.Fatalf("a rejected call moved the shipment to %s", s)
++	}
++	if code, _ := webhook(t, body); code != http.StatusOK {
++		t.Fatalf("correctly signed call: got %d, want 200", code)
++	}
++}
++
++func TestWebhookWithoutASecretRefusesEveryCall(t *testing.T) {
++	setupTestDB(t)
++	createFor(t, 42)
++	body := fmt.Sprintf(`{"tracking_number":%q,"status":"in_transit"}`, trackingOf(t, 42))
++	webhookSecret = nil
++	rec := httptest.NewRecorder()
++	req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewBufferString(body))
++	req.Header.Set("X-Carrier-Signature", sign("", body))
++	handleCarrierWebhook(rec, req)
++	if rec.Code != http.StatusServiceUnavailable {
++		t.Fatalf("no secret configured: got %d, want 503", rec.Code)
++	}
++}
++
++func shipmentStatus(t *testing.T, orderID int) string {
++	t.Helper()
++	var s string
++	if err := db.QueryRow(`SELECT status FROM shipments WHERE order_id = $1`, orderID).Scan(&s); err != nil {
++		t.Fatalf("status: %v", err)
++	}
++	return s
++}
+diff --git a/services/worker/main.go b/services/worker/main.go
+index 07d7339..26ad3a8 100644
+--- a/services/worker/main.go
++++ b/services/worker/main.go
+@@ -282,7 +282,9 @@ func processNewOrder(client *http.Client, services map[string]string, o newOrder
+ 		return fmt.Errorf("reserve: unexpected status %d", code)
+ 	}
+ 
+-	code, err = sendJSON(client, http.MethodPost, services["payment"]+"/charge", map[string]interface{}{
++	// Every retry of this order's charge uses the same key, so payment answers a retry
++	// with the first result, a decline included, instead of trying the card again.
++	code, err = sendJSONWithKey(client, http.MethodPost, services["payment"]+"/charge", chargeKey(o.OrderID), map[string]interface{}{
+ 		"order_id":    o.OrderID,
+ 		"customer_id": o.CustomerID,
+ 		"amount":      o.Total,
+@@ -397,11 +399,22 @@ func refundCharge(client *http.Client, services map[string]string, orderID int)
+ 
+ // orderInfo is the part of an order the worker needs for emails and shipments.
+ type orderInfo struct {
+-	ID         int     `json:"id"`
+-	CustomerID string  `json:"customer_id"`
+-	Status     string  `json:"status"`
+-	Total      float64 `json:"total"`
+-	Currency   string  `json:"currency"`
++	ID              int           `json:"id"`
++	CustomerID      string        `json:"customer_id"`
++	Status          string        `json:"status"`
++	Total           float64       `json:"total"`
++	Currency        string        `json:"currency"`
++	ShippingAddress *orderAddress `json:"shipping_address"`
++}
++
++// orderAddress is the address order-service stored with the order (checked there).
++type orderAddress struct {
++	Name     string `json:"name"`
++	Line1    string `json:"line1"`
++	Line2    string `json:"line2"`
++	City     string `json:"city"`
++	Postcode string `json:"postcode"`
++	Country  string `json:"country"`
+ }
+ 
+ // getOrder asks order-service for the order as it is now.
+@@ -428,25 +441,33 @@ func getOrderStatus(client *http.Client, services map[string]string, orderID int
+ 	return order.Status, err
+ }
+ 
+-// There is no address model yet (ALPHA-78), so every shipment gets this placeholder.
+-// The shipment, its tracking number and its status all work; only the address is empty.
+-const placeholderAddress = "PLACEHOLDER - no address collected yet (ALPHA-78)"
++// Orders placed before addresses existed have none, and their shipments get this
++// placeholder. The shipment, its tracking number and its status still work.
++const placeholderAddress = "PLACEHOLDER - no address on the order"
+ 
+ // createShipment makes the order's shipment. Safe to repeat: shipping-service keeps one
+ // shipment per order and answers 200 with the existing one.
+ func createShipment(client *http.Client, services map[string]string, o orderInfo) error {
+-	recipient := o.CustomerID
+-	if recipient == "" {
+-		recipient = "unknown customer"
+-	}
+-	code, err := sendJSON(client, http.MethodPost, services["shipping"]+"/shipments", map[string]interface{}{
+-		"order_id":       o.ID,
+-		"recipient_name": recipient,
+-		"address_line1":  placeholderAddress,
+-		"city":           "TBC",
+-		"postcode":       "TBC",
+-		"country":        "GB",
+-	})
++	shipment := map[string]interface{}{"order_id": o.ID}
++	if a := o.ShippingAddress; a != nil {
++		shipment["recipient_name"] = a.Name
++		shipment["address_line1"] = a.Line1
++		shipment["address_line2"] = a.Line2
++		shipment["city"] = a.City
++		shipment["postcode"] = a.Postcode
++		shipment["country"] = a.Country
++	} else {
++		recipient := o.CustomerID
++		if recipient == "" {
++			recipient = "unknown customer"
++		}
++		shipment["recipient_name"] = recipient
++		shipment["address_line1"] = placeholderAddress
++		shipment["city"] = "TBC"
++		shipment["postcode"] = "TBC"
++		shipment["country"] = "GB"
++	}
++	code, err := sendJSON(client, http.MethodPost, services["shipping"]+"/shipments", shipment)
+ 	if err != nil {
+ 		return fmt.Errorf("create shipment: %w", err)
+ 	}
+@@ -573,9 +594,21 @@ func sendJSON(client *http.Client, method, url string, body interface{}) (int, e
+ 	return doJSON(client, method, url, body, nil)
+ }
+ 
++// chargeKey is the Idempotency-Key for an order's charge: the same for every retry.
++func chargeKey(orderID int) string { return fmt.Sprintf("charge-order-%d", orderID) }
++
++// sendJSONWithKey is sendJSON with an Idempotency-Key header.
++func sendJSONWithKey(client *http.Client, method, url, key string, body interface{}) (int, error) {
++	return doRequest(client, method, url, map[string]string{"Idempotency-Key": key}, body, nil)
++}
++
+ // doJSON is sendJSON that also decodes a JSON response into out (when out is not nil
+ // and the response is 200). A response that can't be decoded leaves out empty.
+ func doJSON(client *http.Client, method, url string, body interface{}, out interface{}) (int, error) {
++	return doRequest(client, method, url, nil, body, out)
++}
++
++func doRequest(client *http.Client, method, url string, headers map[string]string, body interface{}, out interface{}) (int, error) {
+ 	b, err := json.Marshal(body)
+ 	if err != nil {
+ 		return 0, err
+@@ -585,6 +618,9 @@ func doJSON(client *http.Client, method, url string, body interface{}, out inter
+ 		return 0, err
+ 	}
+ 	req.Header.Set("Content-Type", "application/json")
++	for k, v := range headers {
++		req.Header.Set(k, v)
++	}
+ 	resp, err := client.Do(req)
+ 	if err != nil {
+ 		return 0, err
+diff --git a/services/worker/main_test.go b/services/worker/main_test.go
+index e05b5c2..2016b40 100644
+--- a/services/worker/main_test.go
++++ b/services/worker/main_test.go
+@@ -28,6 +28,8 @@ type fakeServices struct {
+ 	codes       map[string]int                    // path -> status code, default 200
+ 	seq         map[string][]int                  // path -> codes for the next calls, used before codes
+ 	orderStatus string                            // what GET /42 reports, default "pending"
++	address     map[string]interface{}            // shipping_address GET /42 reports, none by default
++	keys        map[string]string                 // call -> Idempotency-Key header it carried
+ }
+ 
+ func newFakeServices(t *testing.T, codes map[string]int) (*fakeServices, map[string]string) {
+@@ -37,7 +39,7 @@ func newFakeServices(t *testing.T, codes map[string]int) (*fakeServices, map[str
+ 
+ func newFakeServicesWithStatus(t *testing.T, codes map[string]int, orderStatus string) (*fakeServices, map[string]string) {
+ 	t.Helper()
+-	f := &fakeServices{codes: codes, orderStatus: orderStatus, bodies: map[string]map[string]interface{}{}}
++	f := &fakeServices{codes: codes, orderStatus: orderStatus, bodies: map[string]map[string]interface{}{}, keys: map[string]string{}}
+ 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 		call := r.Method + " " + r.URL.Path
+ 		var body map[string]interface{}
+@@ -56,6 +58,7 @@ func newFakeServicesWithStatus(t *testing.T, codes map[string]int, orderStatus s
+ 		f.mu.Lock()
+ 		f.calls = append(f.calls, call)
+ 		f.bodies[call] = body
++		f.keys[call] = r.Header.Get("Idempotency-Key")
+ 		code, ok := f.codes[r.URL.Path]
+ 		if q := f.seq[r.URL.Path]; len(q) > 0 {
+ 			code, ok = q[0], true
+@@ -71,9 +74,13 @@ func newFakeServicesWithStatus(t *testing.T, codes map[string]int, orderStatus s
+ 		}
+ 		switch {
+ 		case r.Method == http.MethodGet:
+-			json.NewEncoder(w).Encode(map[string]interface{}{
++			order := map[string]interface{}{
+ 				"status": f.orderStatus, "customer_id": "sara@example.com", "total": 239.97, "currency": "GBP",
+-			})
++			}
++			if f.address != nil {
++				order["shipping_address"] = f.address
++			}
++			json.NewEncoder(w).Encode(order)
+ 		case strings.HasPrefix(r.URL.Path, "/shipments/by-order/"):
+ 			json.NewEncoder(w).Encode(map[string]interface{}{"tracking_number": "RM123"})
+ 		}
+@@ -497,3 +504,29 @@ func TestReserveAgainOutageKeepsMessageForRetry(t *testing.T) {
+ 		t.Fatal("got nil, want an error so SQS retries")
+ 	}
+ }
++
++func TestProcessingOrderShipsToTheOrdersAddress(t *testing.T) {
++	f, services := newFakeServicesWithStatus(t, map[string]int{"/shipments": 201}, "processing")
++	f.address = map[string]interface{}{"name": "Sam Shopper", "line1": "1 High St", "city": "Leeds", "postcode": "LS1 1AA", "country": "GB"}
++	if err := handleEvent(&http.Client{Timeout: 2 * time.Second}, services, statusChanged(t, "confirmed", "processing")); err != nil {
++		t.Fatalf("got error %v, want nil", err)
++	}
++	sent := f.bodies["POST /shipments"]
++	if sent["recipient_name"] != "Sam Shopper" || sent["address_line1"] != "1 High St" || sent["city"] != "Leeds" || sent["postcode"] != "LS1 1AA" {
++		t.Fatalf("shipment did not use the order's address: %v", sent)
++	}
++}
++
++// Every retry of one order's charge must carry the same key, so payment can answer a
++// retry with the first result (a decline included) instead of trying the card again.
++func TestChargeCarriesTheSameKeyOnEveryRetry(t *testing.T) {
++	var keys []string
++	for i := 0; i < 2; i++ {
++		f, services := newFakeServices(t, map[string]int{"/charge": 500})
++		_ = handleEvent(&http.Client{Timeout: 2 * time.Second}, services, orderCreated(t))
++		keys = append(keys, f.keys["POST /charge"])
++	}
++	if keys[0] != "charge-order-42" || keys[1] != keys[0] {
++		t.Fatalf("charge keys %q, want charge-order-42 both times", keys)
++	}
++}

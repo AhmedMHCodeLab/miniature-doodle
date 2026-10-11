@@ -1,0 +1,3 @@
+fix(app): close the remaining order flow gaps
+
+Refs: ALPHA-81

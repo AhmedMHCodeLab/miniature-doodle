@@ -26,7 +26,9 @@ type fakeServices struct {
 	calls       []string
 	bodies      map[string]map[string]interface{} // call -> last JSON body sent
 	codes       map[string]int                    // path -> status code, default 200
+	seq         map[string][]int                  // path -> codes for the next calls, used before codes
 	orderStatus string                            // what GET /42 reports, default "pending"
+	keys        map[string]string                 // call -> Idempotency-Key header it carried
 }
 
 func newFakeServices(t *testing.T, codes map[string]int) (*fakeServices, map[string]string) {
@@ -36,7 +38,7 @@ func newFakeServices(t *testing.T, codes map[string]int) (*fakeServices, map[str
 
 func newFakeServicesWithStatus(t *testing.T, codes map[string]int, orderStatus string) (*fakeServices, map[string]string) {
 	t.Helper()
-	f := &fakeServices{codes: codes, orderStatus: orderStatus, bodies: map[string]map[string]interface{}{}}
+	f := &fakeServices{codes: codes, orderStatus: orderStatus, bodies: map[string]map[string]interface{}{}, keys: map[string]string{}}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		call := r.Method + " " + r.URL.Path
 		var body map[string]interface{}
@@ -55,7 +57,12 @@ func newFakeServicesWithStatus(t *testing.T, codes map[string]int, orderStatus s
 		f.mu.Lock()
 		f.calls = append(f.calls, call)
 		f.bodies[call] = body
+		f.keys[call] = r.Header.Get("Idempotency-Key")
 		code, ok := f.codes[r.URL.Path]
+		if q := f.seq[r.URL.Path]; len(q) > 0 {
+			code, ok = q[0], true
+			f.seq[r.URL.Path] = q[1:]
+		}
 		f.mu.Unlock()
 		if !ok {
 			code = http.StatusOK
@@ -271,7 +278,7 @@ func TestCancelledOrderGetsStockAndMoneyBack(t *testing.T) {
 	if err != nil {
 		t.Fatalf("got error %v, want nil", err)
 	}
-	assertCalls(t, calls, []string{"POST /release", "POST /restock", "POST /refund", "PUT /shipments/by-order/42 cancelled"})
+	assertCalls(t, calls, []string{"POST /release", "POST /restock", "POST /refund", "PUT /shipments/by-order/42 cancelled", "GET /42", "POST /send order_cancelled"})
 }
 
 // Order that never got charged: payment-service answers 404 and that is fine.
@@ -280,7 +287,7 @@ func TestCancelledOrderThatWasNeverChargedIsStillFine(t *testing.T) {
 	if err != nil {
 		t.Fatalf("got error %v, want nil (nothing to refund, no shipment to cancel)", err)
 	}
-	assertCalls(t, calls, []string{"POST /release", "POST /restock", "POST /refund", "PUT /shipments/by-order/42 cancelled"})
+	assertCalls(t, calls, []string{"POST /release", "POST /restock", "POST /refund", "PUT /shipments/by-order/42 cancelled", "GET /42", "POST /send order_cancelled"})
 }
 
 func runStatus(t *testing.T, codes map[string]int, orderStatus string, event Event) (*fakeServices, error) {
@@ -415,5 +422,93 @@ func TestBadStatusChangedPayloadKeepsMessageForRetry(t *testing.T) {
 	_, err := run(t, nil, Event{ID: "x", Type: "order.status_changed", Payload: json.RawMessage(`not json`)})
 	if err == nil {
 		t.Fatal("got nil, want an error")
+	}
+}
+
+// The customer is told when their order is cancelled, whatever the reason, and once only.
+func TestCancelledOrderEmailsTheCustomerOnce(t *testing.T) {
+	f, err := runStatus(t, nil, "cancelled", statusChanged(t, "pending", "cancelled"))
+	if err != nil {
+		t.Fatalf("got error %v, want nil", err)
+	}
+	sent := f.bodies["POST /send order_cancelled"]
+	if sent["recipient"] != "sara@example.com" || sent["dedupe_key"] != "order_cancelled:42" {
+		t.Errorf("email: %v, want to sara@example.com with dedupe key order_cancelled:42", sent)
+	}
+}
+
+// Unlike the payment-failed email, this one must not be lost: if it cannot be sent the
+// message goes back on the queue, and the retry (everything before it is safe to repeat)
+// sends it.
+func TestCancelledEmailFailureKeepsEventForRetry(t *testing.T) {
+	f, err := runStatus(t, map[string]int{"/send": 500}, "cancelled", statusChanged(t, "confirmed", "cancelled"))
+	if err == nil {
+		t.Fatal("got nil, want an error so the email is not forgotten")
+	}
+	assertCalls(t, f.calls, []string{"POST /release", "POST /restock", "POST /refund", "PUT /shipments/by-order/42 cancelled", "GET /42", "POST /send order_cancelled"})
+}
+
+func TestCancelledEventWhenOrderLookupFailsKeepsEventForRetry(t *testing.T) {
+	_, err := run(t, map[string]int{"/42": 500}, statusChanged(t, "confirmed", "cancelled"))
+	if err == nil {
+		t.Fatal("got nil, want an error")
+	}
+}
+
+// --- the hold expired before the commit (the customer has already paid) ---
+
+func runSeq(t *testing.T, seq map[string][]int, orderStatus string, event Event, codes map[string]int) ([]string, error) {
+	t.Helper()
+	f, services := newFakeServicesWithStatus(t, codes, orderStatus)
+	f.seq = seq
+	err := handleEvent(&http.Client{Timeout: 2 * time.Second}, services, event)
+	return f.calls, err
+}
+
+func TestExpiredHoldIsTakenAgainAndCommitted(t *testing.T) {
+	calls, err := runSeq(t, map[string][]int{"/commit": {409, 200}}, "pending", orderCreated(t), map[string]int{"/reserve": 201, "/charge": 201})
+	if err != nil {
+		t.Fatalf("got error %v, want nil", err)
+	}
+	assertCalls(t, calls, []string{"GET /42", "POST /reserve", "POST /charge", "PUT /status confirmed", "POST /commit", "POST /reserve", "POST /commit"})
+}
+
+// Paid, but the stock was sold to someone else while the hold was gone: cancel so the
+// charge is refunded (the cancel event does the refund).
+func TestExpiredHoldWithNoStockLeftCancelsThePaidOrder(t *testing.T) {
+	calls, err := runSeq(t, map[string][]int{"/commit": {409}, "/reserve": {201, 409}}, "pending", orderCreated(t), map[string]int{"/charge": 201})
+	if err != nil {
+		t.Fatalf("got error %v, want nil (final answer)", err)
+	}
+	assertCalls(t, calls, []string{"GET /42", "POST /reserve", "POST /charge", "PUT /status confirmed", "POST /commit", "POST /reserve", "PUT /status cancelled"})
+}
+
+// The same message redelivered much later (a DLQ redrive): the order is confirmed but its
+// hold is long gone.
+func TestRedeliveredConfirmedOrderWithExpiredHoldHoldsAgain(t *testing.T) {
+	calls, err := runSeq(t, map[string][]int{"/commit": {409, 200}}, "confirmed", orderCreated(t), nil)
+	if err != nil {
+		t.Fatalf("got error %v, want nil", err)
+	}
+	assertCalls(t, calls, []string{"GET /42", "POST /commit", "POST /reserve", "POST /commit"})
+}
+
+func TestReserveAgainOutageKeepsMessageForRetry(t *testing.T) {
+	_, err := runSeq(t, map[string][]int{"/commit": {409}, "/reserve": {201, 500}}, "pending", orderCreated(t), map[string]int{"/charge": 201})
+	if err == nil {
+		t.Fatal("got nil, want an error so SQS retries")
+	}
+}
+
+// Every retry of one order's charge carries the same key.
+func TestChargeCarriesTheSameKeyOnEveryRetry(t *testing.T) {
+	var keys []string
+	for i := 0; i < 2; i++ {
+		f, services := newFakeServices(t, map[string]int{"/charge": 500})
+		_ = handleEvent(&http.Client{Timeout: 2 * time.Second}, services, orderCreated(t))
+		keys = append(keys, f.keys["POST /charge"])
+	}
+	if keys[0] != "charge-order-42" || keys[1] != keys[0] {
+		t.Fatalf("charge keys %q, want charge-order-42 both times", keys)
 	}
 }
