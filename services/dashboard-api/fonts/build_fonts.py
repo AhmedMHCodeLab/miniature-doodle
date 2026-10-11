@@ -1,4 +1,4 @@
-"""Rebuild the two fonts embedded in ../static/index.html.
+"""Rebuild the three fonts embedded in ../static/index.html.
 
 Downloads the Latin variable fonts from Google Fonts, keeps only the characters and axis
 ranges the page uses, and writes them as base64 into the page's @font-face rules.
@@ -31,8 +31,10 @@ UNICODES = list(range(0x20, 0x7F)) + [
 
 FONTS = [
     # (family in the CSS rule, Google Fonts query, axis limits, OpenType features kept)
-    ("Archivo", "Archivo:wdth,wght@62..125,100..900", {"wght": (300, 800), "wdth": (100, 125)},
-     ["kern", "liga", "tnum", "lnum", "case", "calt", "ss01"]),
+    ("Manrope", "Manrope:wght@200..800", {"wght": (500, 800)},
+     ["kern", "liga", "tnum", "lnum", "case", "calt"]),
+    ("Inter", "Inter:opsz,wght@14..32,100..900", {"wght": (400, 700), "opsz": 14},
+     ["kern", "liga", "tnum", "lnum", "case", "calt", "cv11", "ss01"]),
     ("JetBrains Mono", "JetBrains+Mono:wght@100..800", {"wght": (400, 700)},
      ["kern", "tnum", "zero", "calt"]),
 ]

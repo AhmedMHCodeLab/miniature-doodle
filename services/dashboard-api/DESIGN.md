@@ -2,7 +2,9 @@
 
 The page that dashboard-api serves at `/` (and the gateway forwards to at `/`). It is the
 whole front end of the platform: ordering equipment for new starters, then running
-fulfilment, stock, payments, shipping, notifications and service health.
+fulfilment, stock, payments, shipping, notifications and service health. It is Team Alpha's
+build of the CoderCo order platform: the logo and favicon are the team's wolf, and the colour
+and type follow CoderCo's current brand (dark grounds, electric purple, Manrope and Inter).
 
 ## The idea: a kit of parts
 
@@ -15,25 +17,27 @@ Equipping a new starter is exactly that, so the page treats every order as a dra
   same stages the worker and order-service move an order through
 - each view is a numbered **sheet** (Sheet 01 Kit … Sheet 08 Systems)
 
-**The signature moment is the plan.** A blueprint of one workstation, in CoderCo navy. Add a
-part and a pen head travels to its place on the desk and plots it in coral. The drawing
-then cools to white and gets a callout with its bill-of-materials line number. Quantities
+**The signature moment is the plan.** A blueprint of one workstation, on CoderCo's dark
+purple. Add a part and a pen head travels to its place on the desk and plots it in light
+violet. The drawing then cools to lavender and gets a callout with its bill-of-materials
+line number. Quantities
 over one get a dashed echo behind the part. When the order is placed, the title block
 shows the order number and live status, and an ISSUED stamp lands on the drawing. The
 plan only animates when it is on screen. Parts added while it is off screen are drawn when
 it scrolls back into view, and with reduced motion they appear at once.
 
-Why it fits CoderCo: they build engineers, and their brand is navy, coral and a monospace
-wordmark. Technical drawing, monospace data and a CI/CD-style pipeline are the language of
-the people this tool is for. The coral is used as the pen, the one thing that is changing
-or needs action, not as decoration.
+Why it fits CoderCo: they build engineers, and their brand is now dark grounds with one
+electric purple. Technical drawing, monospace data and a CI/CD-style pipeline are the
+language of the people this tool is for. Purple is used as the pen: the one thing that is
+changing or needs action, the primary action, the current step. It is never a glow or a
+background wash.
 
 ## System
 
 | | |
 |---|---|
-| Colour | Navy `#242E46` (ink, plan ground), coral `#FF7759` (pen: fills or on navy only), paper `#F4F2EE`, sheet `#FBFAF7`. Coral text on paper uses `#B8401F` (4.9:1). Text never goes lighter than `#5B6480` (5.2:1). Order stages use one navy ramp, light to dark, so they read as progress; cancelled is red. |
-| Type | Archivo, expanded (`font-stretch: 125%`, ~760) for display; Archivo at normal width for text; JetBrains Mono for data, labels, SKUs and money, echoing the CoderCo wordmark. Both embedded, see `fonts/`. |
+| Colour | From coderco.io's own tokens. Ground `#0B1020`, wells `#0F1324`, surfaces `#151A2D` / `#1D2440`, dark purple `#160B35` for the plan, the brand block and the kit bar. Purple `#6C00FF` is for fills only (white on it 6.8:1; it is 2.8:1 against the ground); text, focus rings, markers and the pen use `#B79BFF` (7.5:1). The one gradient is the brand's CTA gradient `#5700D6 → #7A22FF`, on Place order only. Text is `#F3F2F8` / `#CBCFD8` / `#9AA0AD`, never lighter than 5.8:1. Status: `#FF7A7A` fail, `#4CC79A` ok, `#F2B84B` warning (low stock). Order stages use one violet ramp that brightens as an order progresses; cancelled is red. |
+| Type | Manrope 800 for display, headings and big figures; Inter for text and controls (CoderCo's two brand faces); JetBrains Mono for data, labels, SKUs and money. All embedded, see `fonts/`. |
 | Grid | 12 columns, max width 1440, side gutter `clamp(16px, 4vw, 56px)`. The kit splits 6/6 with the board (plan + bill) sticky on the right. |
 | Surfaces | Hairline borders, square corners (3px controls, 6px sheets). Shadows only for things that float: toasts, the mobile sheet, the kit bar. No gradients, no glass. |
 | Drawings | Orthographic line work in millimetres, one stroke weight, no fills (`DRAWINGS` in the script). The kind of part is read from its name or id (`KINDS`); unknown parts are drawn as a labelled parcel. To add a kind, add a drawing, a `KINDS` rule and a desk `SLOTS` entry. |
@@ -53,8 +57,7 @@ or needs action, not as decoration.
   only `/` to this page without a token; a separate asset would need a gateway change.
 - **Safe by default.** All markup goes through the `html` tag, which escapes every value
   from the API. There are no inline event handlers; one delegated listener per event type.
-- **Accessible.** Real links and buttons, skip link, visible focus (`#B8401F` on paper, coral
-  on navy), focus kept when controls are re-rendered, labelled steppers, a modal review sheet
+- **Accessible.** Real links and buttons, skip link, visible focus (`#B79BFF`), focus kept when controls are re-rendered, labelled steppers, a modal review sheet
   on small screens with focus trap and Escape, table views for charts, 44px touch targets.
 
 ## Working on it
