@@ -62,4 +62,11 @@ npm install --prefix /tmp/deck-deps pptxgenjs@3.12.0 sharp
 NODE_PATH=/tmp/deck-deps/node_modules node build-deck.js
 ```
 
-This rewrites `kit-room-final-demo.pptx` and `presenter-notes.md`. Export the PDF from PowerPoint (File, Export, PDF) or with LibreOffice: `soffice --headless --convert-to pdf kit-room-final-demo.pptx`.
+This rewrites `kit-room-final-demo.pptx` and `presenter-notes.md`. Then run the post-processor and the strict schema check:
+
+```bash
+python3 interactions.py ../kit-room-final-demo.pptx interactions.json   # repairs multi-run paragraphs, adds motion
+python3 check_xml.py ../kit-room-final-demo.pptx <path-to>/pml.xsd       # ECMA-376 PresentationML schema
+```
+
+`interactions.json` lists per-slide transitions and click builds; an empty `{"slides": []}` only repairs the markup. Export the PDF from PowerPoint (File, Export, PDF) or with LibreOffice: `soffice --headless --convert-to pdf kit-room-final-demo.pptx`.
